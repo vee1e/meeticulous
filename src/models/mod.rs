@@ -13,14 +13,32 @@ pub const WHISPER_MODEL_CATALOG: &[(&str, &str, u32, &str, &str)] = &[
     ("base", "ggml-base.bin", 142, "Good", "Fast"),
     ("small", "ggml-small.bin", 466, "Good", "Medium"),
     ("medium", "ggml-medium.bin", 1463, "High", "Slow"),
-    ("large-v3-turbo", "ggml-large-v3-turbo.bin", 1549, "High", "Medium"),
+    (
+        "large-v3-turbo",
+        "ggml-large-v3-turbo.bin",
+        1549,
+        "High",
+        "Medium",
+    ),
     ("large-v3", "ggml-large-v3.bin", 2951, "High", "Slow"),
     ("tiny-q5_1", "ggml-tiny-q5_1.bin", 31, "Decent", "Very Fast"),
     ("base-q5_1", "ggml-base-q5_1.bin", 57, "Good", "Fast"),
     ("small-q5_1", "ggml-small-q5_1.bin", 181, "Good", "Fast"),
     ("medium-q5_0", "ggml-medium-q5_0.bin", 514, "High", "Medium"),
-    ("large-v3-turbo-q5_0", "ggml-large-v3-turbo-q5_0.bin", 547, "High", "Medium"),
-    ("large-v3-q5_0", "ggml-large-v3-q5_0.bin", 1031, "High", "Slow"),
+    (
+        "large-v3-turbo-q5_0",
+        "ggml-large-v3-turbo-q5_0.bin",
+        547,
+        "High",
+        "Medium",
+    ),
+    (
+        "large-v3-q5_0",
+        "ggml-large-v3-q5_0.bin",
+        1031,
+        "High",
+        "Slow",
+    ),
 ];
 
 pub const DEFAULT_WHISPER_MODEL: &str = "large-v3-turbo";
@@ -187,7 +205,7 @@ pub fn resolve_model_path(
             for &(name, filename, ..) in WHISPER_MODEL_CATALOG {
                 if name == model_name {
                     let p = models_dir.join(filename);
-                    return if p.exists() { Some(p) } else { Some(p) };
+                    return Some(p);
                 }
             }
             let p = models_dir.join(format!("ggml-{model_name}.bin"));
@@ -298,6 +316,9 @@ mod tests {
             "parakeet-tdt-0.6b-v3-int8",
         )
         .unwrap();
-        assert!(p.ends_with("parakeet/parakeet-tdt-0.6b-v3-int8") || p.components().any(|c| c.as_os_str() == "parakeet"));
+        assert!(
+            p.ends_with("parakeet/parakeet-tdt-0.6b-v3-int8")
+                || p.components().any(|c| c.as_os_str() == "parakeet")
+        );
     }
 }

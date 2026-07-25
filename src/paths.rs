@@ -44,7 +44,7 @@ pub fn set_test_app_data_root(path: PathBuf) {
 
 /// Clear is not supported (OnceLock); tests should use unique temp roots via
 /// explicit `MeetilyPaths::with_app_data_dir` instead when isolation is needed.
-
+///
 /// Resolved Meetily data locations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeetilyPaths {
@@ -63,7 +63,10 @@ impl MeetilyPaths {
     /// Production paths matching Meetily GUI on macOS.
     pub fn resolve() -> anyhow::Result<Self> {
         if let Some(test_root) = TEST_APP_DATA_ROOT.get() {
-            return Ok(Self::with_app_data_dir(test_root.clone(), default_recordings_dir()));
+            return Ok(Self::with_app_data_dir(
+                test_root.clone(),
+                default_recordings_dir(),
+            ));
         }
         Ok(Self::with_app_data_dir(
             meetily_app_data_dir()?,
@@ -111,7 +114,8 @@ impl MeetilyPaths {
 /// Uses the same resolution as Tauri's `app_data_dir()` for identifier
 /// `com.meetily.ai`: macOS Application Support + reverse-DNS folder name.
 pub fn meetily_app_data_dir() -> anyhow::Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not resolve home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not resolve home directory"))?;
     Ok(home
         .join("Library")
         .join("Application Support")

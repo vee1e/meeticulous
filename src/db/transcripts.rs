@@ -84,6 +84,7 @@ pub async fn load_transcript_text_plain(
 }
 
 /// Append one transcript segment to an existing meeting.
+#[allow(clippy::too_many_arguments)]
 pub async fn append_transcript_segment(
     pool: &SqlitePool,
     meeting_id: &str,

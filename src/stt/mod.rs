@@ -96,9 +96,7 @@ impl RecordingDiagnostics {
         } else {
             format!(
                 "FAIL · {}",
-                self.system_error
-                    .as_deref()
-                    .unwrap_or("not started")
+                self.system_error.as_deref().unwrap_or("not started")
             )
         };
         let level_bar = level_meter(self.rms);
@@ -258,6 +256,7 @@ pub fn rms_to_db(rms: f32) -> f32 {
 }
 
 /// Spawn background STT worker. Returns join handle (or None if spawn failed).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_stt_worker(
     samples: Arc<Mutex<Vec<f32>>>,
     sample_rate: u32,
@@ -295,6 +294,7 @@ pub fn spawn_stt_worker(
         .ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stt_worker_loop(
     samples: Arc<Mutex<Vec<f32>>>,
     sample_rate: u32,
@@ -443,10 +443,8 @@ fn stt_worker_loop(
             let end = cursor + chunk_samples;
             let chunk = mono_history[cursor..end].to_vec();
             let (c_rms, _) = compute_rms_peak(&chunk);
-            let audio_start =
-                (absolute_mono_offset + cursor as u64) as f64 / sample_rate as f64;
-            let audio_end =
-                (absolute_mono_offset + end as u64) as f64 / sample_rate as f64;
+            let audio_start = (absolute_mono_offset + cursor as u64) as f64 / sample_rate as f64;
+            let audio_end = (absolute_mono_offset + end as u64) as f64 / sample_rate as f64;
 
             if c_rms < min_rms {
                 let mut d = diag.lock().unwrap();
@@ -547,7 +545,9 @@ fn levels_only_loop(
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
         let buf = samples.lock().unwrap().clone();
         let mono = downmix_interleaved(&buf, channels);
-        let window = mono.len().saturating_sub(((sample_rate as f32) * 0.25) as usize);
+        let window = mono
+            .len()
+            .saturating_sub(((sample_rate as f32) * 0.25) as usize);
         let recent = &mono[window..];
         let (rms, peak) = compute_rms_peak(recent);
         {
@@ -595,10 +595,12 @@ mod tests {
 
     #[test]
     fn diagnostics_verbose_includes_mic_and_stt() {
-        let mut d = RecordingDiagnostics::default();
-        d.mic_ok = true;
-        d.mic_device = "Built-in".into();
-        d.stt_status = "ready".into();
+        let mut d = RecordingDiagnostics {
+            mic_ok: true,
+            mic_device: "Built-in".into(),
+            stt_status: "ready".into(),
+            ..Default::default()
+        };
         d.push_log("hello");
         let v = d.format_verbose();
         assert!(v.contains("mic:"));

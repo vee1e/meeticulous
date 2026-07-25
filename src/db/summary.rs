@@ -20,7 +20,10 @@ pub async fn get_summary(
     .await
 }
 
-pub async fn create_or_reset_process(pool: &SqlitePool, meeting_id: &str) -> Result<(), sqlx::Error> {
+pub async fn create_or_reset_process(
+    pool: &SqlitePool,
+    meeting_id: &str,
+) -> Result<(), sqlx::Error> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         r#"

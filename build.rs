@@ -33,7 +33,10 @@ fn main() {
 
     match status {
         Ok(s) if s.success() => {
-            println!("cargo:rustc-env=MEETICULOUS_SYSTEM_AUDIO_HELPER={}", dest.display());
+            println!(
+                "cargo:rustc-env=MEETICULOUS_SYSTEM_AUDIO_HELPER={}",
+                dest.display()
+            );
             // Also copy next to the profile target dir for runtime discovery
             if let Ok(profile) = env::var("PROFILE") {
                 if let Ok(manifest) = env::var("CARGO_MANIFEST_DIR") {
@@ -50,9 +53,7 @@ fn main() {
             );
         }
         Err(e) => {
-            println!(
-                "cargo:warning=swiftc not runnable ({e}); system audio helper not built"
-            );
+            println!("cargo:warning=swiftc not runnable ({e}); system audio helper not built");
         }
     }
 }

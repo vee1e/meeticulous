@@ -1,13 +1,9 @@
 //! Local recording session: capture mic audio, live STT, append transcript to Meetily DB.
 
-use crate::db::{
-    append_transcript_segment, create_meeting, upsert_transcript_chunk, Meeting,
-};
+use crate::db::{append_transcript_segment, create_meeting, upsert_transcript_chunk, Meeting};
 use crate::models::ModelSelection;
 use crate::paths::MeetilyPaths;
-use crate::stt::{
-    spawn_stt_worker, DiagHandle, RecordingDiagnostics, SegmentQueue, SttSegment,
-};
+use crate::stt::{spawn_stt_worker, DiagHandle, RecordingDiagnostics, SegmentQueue, SttSegment};
 use chrono::Utc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::{WavSpec, WavWriter};
@@ -37,6 +33,7 @@ pub struct RecordingHandle {
     sample_rate: u32,
     channels: u16,
     started: Instant,
+    #[allow(dead_code)]
     started_at: chrono::DateTime<Utc>,
     live: Arc<Mutex<Vec<LiveSegment>>>,
     pub diagnostics: DiagHandle,
@@ -125,10 +122,7 @@ pub async fn start_recording(
 
     #[cfg(target_os = "macos")]
     let system_audio = {
-        match crate::system_audio::start_system_audio_capture(
-            samples.clone(),
-            stop_flag.clone(),
-        ) {
+        match crate::system_audio::start_system_audio_capture(samples.clone(), stop_flag.clone()) {
             Ok(sess) => {
                 sample_rate = sess.sample_rate.max(1);
                 channels = 1; // process tap is mono
@@ -141,9 +135,7 @@ pub async fn start_recording(
                     "SYSTEM AUDIO OK: {} @ {} Hz (Core Audio process tap)",
                     sess.device_name, sample_rate
                 ));
-                d.push_log(
-                    "capturing what your Mac plays (Zoom/Meet/browser) — not just the mic",
-                );
+                d.push_log("capturing what your Mac plays (Zoom/Meet/browser) — not just the mic");
                 Some(sess)
             }
             Err(e) => {
@@ -193,9 +185,7 @@ pub async fn start_recording(
             let _ = (mic_sr, mic_ch);
             if system_up {
                 let mut d = diagnostics.lock().unwrap();
-                d.push_log(
-                    "mic open for presence; STT uses SYSTEM AUDIO only (meeting playback)",
-                );
+                d.push_log("mic open for presence; STT uses SYSTEM AUDIO only (meeting playback)");
             }
             stream
         }
@@ -265,9 +255,7 @@ fn start_cpal_capture(
     let device = host
         .default_input_device()
         .ok_or_else(|| anyhow::anyhow!("no default input device (check mic permission)"))?;
-    let device_name = device
-        .name()
-        .unwrap_or_else(|_| "(unnamed input)".into());
+    let device_name = device.name().unwrap_or_else(|_| "(unnamed input)".into());
     let config = device
         .default_input_config()
         .map_err(|e| anyhow::anyhow!("input config: {e}"))?;
@@ -486,7 +474,10 @@ pub async fn append_text_segment(
         g.push(seg.clone());
     }
     if let Ok(mut d) = handle.diagnostics.lock() {
-        d.push_log(format!("segment saved: {}", text.chars().take(60).collect::<String>()));
+        d.push_log(format!(
+            "segment saved: {}",
+            text.chars().take(60).collect::<String>()
+        ));
     }
     Ok(seg)
 }

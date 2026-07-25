@@ -175,11 +175,9 @@ pub async fn apply_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     let _ = sqlx::query("ALTER TABLE summary_processes ADD COLUMN result_backup TEXT")
         .execute(pool)
         .await;
-    let _ = sqlx::query(
-        "ALTER TABLE summary_processes ADD COLUMN result_backup_timestamp TEXT",
-    )
-    .execute(pool)
-    .await;
+    let _ = sqlx::query("ALTER TABLE summary_processes ADD COLUMN result_backup_timestamp TEXT")
+        .execute(pool)
+        .await;
 
     Ok(())
 }
@@ -209,9 +207,7 @@ mod tests {
         let pool = open_database(&paths.db_path).await.unwrap();
         assert!(paths.db_path.file_name().unwrap() == "meeting_minutes.sqlite");
 
-        let meeting_id = create_meeting(&pool, "Test Meeting", None)
-            .await
-            .unwrap();
+        let meeting_id = create_meeting(&pool, "Test Meeting", None).await.unwrap();
         assert!(meeting_id.starts_with("meeting-"));
 
         append_transcript_segment(
@@ -238,7 +234,10 @@ mod tests {
 
         let text = load_transcript_text(&pool, &meeting_id).await.unwrap();
         assert!(text.contains("Hello from meeticulous"));
-        assert!(text.contains("[00:00]"), "expected MM:SS timestamp, got: {text}");
+        assert!(
+            text.contains("[00:00]"),
+            "expected MM:SS timestamp, got: {text}"
+        );
 
         cleanup(&pool).await.unwrap();
     }

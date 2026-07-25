@@ -48,10 +48,8 @@ pub fn markdown_to_lines(md: &str) -> Vec<Line<'static>> {
                     };
                     style_stack.push(style);
                 }
-                Tag::Paragraph => {
-                    if !current.is_empty() {
-                        push_line(&mut lines, &mut current);
-                    }
+                Tag::Paragraph if !current.is_empty() => {
+                    push_line(&mut lines, &mut current);
                 }
                 Tag::List(_) => {
                     list_depth += 1;
@@ -86,7 +84,11 @@ pub fn markdown_to_lines(md: &str) -> Vec<Line<'static>> {
                     if !current.is_empty() {
                         push_line(&mut lines, &mut current);
                     }
-                    style_stack.push(Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC));
+                    style_stack.push(
+                        Style::default()
+                            .fg(Color::Gray)
+                            .add_modifier(Modifier::ITALIC),
+                    );
                     pending_prefix = Some("│ ".into());
                 }
                 Tag::Link { .. } | Tag::Image { .. } => {

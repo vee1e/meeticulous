@@ -109,17 +109,15 @@ pub fn find_opencode() -> Option<PathBuf> {
 
 /// Resolve Antigravity CLI (`agy`).
 pub fn find_antigravity() -> Option<PathBuf> {
-    which("agy")
-        .or_else(|| which("antigravity"))
-        .or_else(|| {
-            let home = dirs::home_dir()?;
-            let p = home.join(".local/bin/agy");
-            if p.is_file() {
-                Some(p)
-            } else {
-                None
-            }
-        })
+    which("agy").or_else(|| which("antigravity")).or_else(|| {
+        let home = dirs::home_dir()?;
+        let p = home.join(".local/bin/agy");
+        if p.is_file() {
+            Some(p)
+        } else {
+            None
+        }
+    })
 }
 
 /// Resolve Claude Code CLI.
@@ -431,9 +429,7 @@ impl LlmTransport for ClaudeTransport {
 }
 
 /// Build the preferred transport for a backend choice.
-pub fn transport_for_backend(
-    backend: SummaryCliBackend,
-) -> Result<Box<dyn LlmTransport>, String> {
+pub fn transport_for_backend(backend: SummaryCliBackend) -> Result<Box<dyn LlmTransport>, String> {
     match backend {
         SummaryCliBackend::Opencode => Ok(Box::new(OpencodeTransport::discover()?)),
         SummaryCliBackend::Antigravity => Ok(Box::new(AntigravityTransport::discover()?)),
@@ -580,11 +576,7 @@ mod tests {
     fn legacy_http_prefs_migrate() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join(PREFS_FILE);
-        std::fs::write(
-            &p,
-            r#"{"backend":"http","context":"x","model":""}"#,
-        )
-        .unwrap();
+        std::fs::write(&p, r#"{"backend":"http","context":"x","model":""}"#).unwrap();
         let loaded = load_summary_prefs(tmp.path());
         assert_eq!(loaded.backend, SummaryCliBackend::Opencode);
     }

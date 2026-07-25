@@ -127,27 +127,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Some(Commands::Import { audio, title, text }) => {
             let pool = db::open_meetily_database(&paths).await?;
-            let sel = models::load_selection_from_app_data(&paths.app_data_dir)
-                .unwrap_or_default();
+            let sel = models::load_selection_from_app_data(&paths.app_data_dir).unwrap_or_default();
             let lines: Vec<&str> = text.iter().map(|s| s.as_str()).collect();
-            let id = recording::import_audio_file(
-                &pool,
-                &paths,
-                &audio,
-                title.as_deref(),
-                &lines,
-                &sel,
-            )
-            .await?;
+            let id =
+                recording::import_audio_file(&pool, &paths, &audio, title.as_deref(), &lines, &sel)
+                    .await?;
             println!("Imported meeting {id}");
             db::cleanup(&pool).await?;
         }
         Some(Commands::RecordDryRun { title, line }) => {
             let pool = db::open_meetily_database(&paths).await?;
-            let sel = models::load_selection_from_app_data(&paths.app_data_dir)
-                .unwrap_or_default();
-            let handle =
-                recording::start_recording(&pool, &paths, Some(&title), &sel).await?;
+            let sel = models::load_selection_from_app_data(&paths.app_data_dir).unwrap_or_default();
+            let handle = recording::start_recording(&pool, &paths, Some(&title), &sel).await?;
             let lines: Vec<&str> = if line.is_empty() {
                 vec!["dry-run segment"]
             } else {
@@ -185,8 +176,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let pool = db::open_meetily_database(&paths).await?;
             let backend = summary::SummaryCliBackend::from_str_loose(&backend)
                 .ok_or_else(|| anyhow::anyhow!("unknown backend: {backend}"))?;
-            let transport = summary::transport_for_backend(backend)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let transport =
+                summary::transport_for_backend(backend).map_err(|e| anyhow::anyhow!(e))?;
             let transcript = db::load_transcript_text_plain(&pool, &meeting_id).await?;
             // Never pass fake model labels like "agy" / "opencode" as --model.
             let res = summary::generate_meeting_summary_with_context(

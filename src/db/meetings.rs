@@ -13,7 +13,10 @@ pub async fn list_meetings(pool: &SqlitePool) -> Result<Vec<Meeting>, sqlx::Erro
 }
 
 /// Fetch one meeting by id.
-pub async fn get_meeting(pool: &SqlitePool, meeting_id: &str) -> Result<Option<Meeting>, sqlx::Error> {
+pub async fn get_meeting(
+    pool: &SqlitePool,
+    meeting_id: &str,
+) -> Result<Option<Meeting>, sqlx::Error> {
     sqlx::query_as::<_, Meeting>(
         "SELECT id, title, created_at, updated_at, folder_path FROM meetings WHERE id = ?",
     )

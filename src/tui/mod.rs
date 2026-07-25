@@ -129,8 +129,8 @@ pub struct App {
 
 impl App {
     pub async fn new(paths: MeetilyPaths, pool: SqlitePool) -> anyhow::Result<Self> {
-        let mut model_selection = load_selection_from_app_data(&paths.app_data_dir)
-            .unwrap_or_default();
+        let mut model_selection =
+            load_selection_from_app_data(&paths.app_data_dir).unwrap_or_default();
         if let Ok(Some(ts)) = db::get_transcript_config(&pool).await {
             if let Some(p) = TranscriptionProvider::from_str_loose(&ts.provider) {
                 model_selection = ModelSelection {
@@ -217,10 +217,7 @@ impl App {
             .into_iter()
             .map(|m| {
                 let mark = if m.available { "✓" } else { " " };
-                format!(
-                    "[{mark}] {} / {} ({} MB)",
-                    m.provider, m.name, m.size_mb
-                )
+                format!("[{mark}] {} / {} ({} MB)", m.provider, m.name, m.size_mb)
             })
             .collect();
         if self.models_list.is_empty() {
@@ -322,10 +319,7 @@ impl App {
         }
         match copy_to_clipboard(&text) {
             Ok(()) => {
-                self.status = format!(
-                    "Copied {} chars to clipboard",
-                    text.chars().count()
-                );
+                self.status = format!("Copied {} chars to clipboard", text.chars().count());
             }
             Err(e) => {
                 self.status = format!("Copy failed: {e}");
@@ -601,17 +595,10 @@ impl App {
 
     /// Load summary from Meetily `summary_processes` into the summary pane.
     /// Returns true if a summary was shown.
-    async fn load_summary_for_meeting(
-        &mut self,
-        id: &str,
-        title: &str,
-    ) -> anyhow::Result<bool> {
+    async fn load_summary_for_meeting(&mut self, id: &str, title: &str) -> anyhow::Result<bool> {
         match db::load_summary_plain_text(&self.pool, id).await? {
             Some((body, status)) => {
-                self.set_summary_body(
-                    body,
-                    format!("saved in Meetily DB · status={status}"),
-                );
+                self.set_summary_body(body, format!("saved in Meetily DB · status={status}"));
                 self.pending_g = false;
                 self.screen = Screen::Summary;
                 self.status = format!(
@@ -691,8 +678,7 @@ impl App {
             self.screen = Screen::Meetings;
         } else {
             let sel = self.model_selection.clone();
-            let handle =
-                recording::start_recording(&self.pool, &self.paths, None, &sel).await?;
+            let handle = recording::start_recording(&self.pool, &self.paths, None, &sel).await?;
             let diag = handle.diagnostics_snapshot();
             self.status = format!(
                 "REC {} · sys={} mic={} · STT {} — r stop",
@@ -866,11 +852,9 @@ pub async fn run_tui(paths: MeetilyPaths, pool: SqlitePool) -> anyhow::Result<()
                                     app.scroll_to(u16::MAX);
                                     app.live_follow = true;
                                 }
-                                KeyCode::Enter => {
-                                    if !app.input_buf.is_empty() {
-                                        let line = std::mem::take(&mut app.input_buf);
-                                        app.append_live_line(line).await?;
-                                    }
+                                KeyCode::Enter if !app.input_buf.is_empty() => {
+                                    let line = std::mem::take(&mut app.input_buf);
+                                    app.append_live_line(line).await?;
                                 }
                                 KeyCode::Backspace => {
                                     app.input_buf.pop();
@@ -986,9 +970,7 @@ pub async fn run_tui(paths: MeetilyPaths, pool: SqlitePool) -> anyhow::Result<()
                                     app.pending_g = false;
                                     app.copy_summary_plaintext();
                                 }
-                                (false, KeyCode::Char('t'))
-                                    if app.screen == Screen::Summary =>
-                                {
+                                (false, KeyCode::Char('t')) if app.screen == Screen::Summary => {
                                     app.pending_g = false;
                                     app.open_transcript().await?;
                                 }
@@ -1136,11 +1118,7 @@ pub async fn run_tui(paths: MeetilyPaths, pool: SqlitePool) -> anyhow::Result<()
                     app.live_lines = segs
                         .into_iter()
                         .map(|s| {
-                            format!(
-                                "[{}] {}",
-                                db::format_media_timestamp(s.audio_start),
-                                s.text
-                            )
+                            format!("[{}] {}", db::format_media_timestamp(s.audio_start), s.text)
                         })
                         .collect();
                     if app.live_follow {
@@ -1305,11 +1283,9 @@ fn draw_summary_markdown(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let scroll = app.scroll.min(max_scroll);
 
     let p = Paragraph::new(lines).scroll((scroll, 0)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(
-                "Summary  j/k · s regen · c copy · t transcript · h back  ({scroll}/{max_scroll})"
-            )),
+        Block::default().borders(Borders::ALL).title(format!(
+            "Summary  j/k · s regen · c copy · t transcript · h back  ({scroll}/{max_scroll})"
+        )),
     );
     f.render_widget(p, area);
 }
@@ -1364,10 +1340,7 @@ fn soft_wrap_line(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
 
     let flush = |cur: &mut Vec<(char, Style)>, out: &mut Vec<Line<'static>>| {
         // Trim trailing spaces on a wrapped line
-        while cur
-            .last()
-            .is_some_and(|(c, _)| c.is_whitespace())
-        {
+        while cur.last().is_some_and(|(c, _)| c.is_whitespace()) {
             cur.pop();
         }
         out.push(chars_to_line(std::mem::take(cur)));
@@ -1493,13 +1466,11 @@ fn draw_recording(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         })
         .unwrap_or_else(|| "no active session".into());
 
-    let diag = Paragraph::new(verbose)
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("verbose · system / mic / STT / log"),
-        );
+    let diag = Paragraph::new(verbose).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("verbose · system / mic / STT / log"),
+    );
     f.render_widget(diag, chunks[0]);
 
     let body = if app.live_lines.is_empty() {
@@ -1525,13 +1496,9 @@ fn draw_recording(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let p = Paragraph::new(body)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(
-                    "live transcript  j/k scroll · G follow · r stop  ({scroll}/{max_scroll} · {follow})"
-                )),
-        );
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            "live transcript  j/k scroll · G follow · r stop  ({scroll}/{max_scroll} · {follow})"
+        )));
     f.render_widget(p, chunks[1]);
 
     let input = Paragraph::new(format!("> {}", app.input_buf)).block(
@@ -1613,13 +1580,11 @@ fn draw_summary_prep(f: &mut ratatui::Frame, app: &App, area: Rect) {
         backend_status_line(app.summary_prefs.backend),
         app.resolved_summary_model(),
     );
-    let p = Paragraph::new(body)
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("summarize · optional context"),
-        );
+    let p = Paragraph::new(body).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("summarize · optional context"),
+    );
     f.render_widget(p, area);
 }
 
@@ -1649,5 +1614,3 @@ fn draw_delete_confirm(f: &mut ratatui::Frame, app: &App, area: Rect) {
         );
     f.render_widget(p, area);
 }
-
-

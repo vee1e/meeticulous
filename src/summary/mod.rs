@@ -57,8 +57,7 @@ pub fn is_placeholder_meeting_title(title: &str) -> bool {
     }
     // "Meeting 2026-07-25_17-17-47" / "Meeting 2026-07-25 17:17:47"
     let lower = t.to_lowercase();
-    if lower.starts_with("meeting ") {
-        let rest = &lower["meeting ".len()..];
+    if let Some(rest) = lower.strip_prefix("meeting ") {
         // mostly digits, dashes, underscores, colons
         let ok = rest.chars().all(|c| {
             c.is_ascii_digit() || c == '-' || c == '_' || c == ':' || c == ' ' || c == 't'
@@ -137,16 +136,18 @@ impl LlmTransport for HttpLlmTransport {
     ) -> Result<String, String> {
         match provider {
             "claude" => claude_complete(&self.client, model, api_key, system, user).await,
-            _ => openai_compatible_complete(
-                &self.client,
-                provider,
-                model,
-                api_key,
-                system,
-                user,
-                ollama_endpoint,
-            )
-            .await,
+            _ => {
+                openai_compatible_complete(
+                    &self.client,
+                    provider,
+                    model,
+                    api_key,
+                    system,
+                    user,
+                    ollama_endpoint,
+                )
+                .await
+            }
         }
     }
 }
@@ -183,10 +184,8 @@ async fn openai_compatible_complete(
     });
 
     let mut req = client.post(&url).json(&body);
-    if provider != "ollama" || !api_key.is_empty() {
-        if !api_key.is_empty() {
-            req = req.bearer_auth(api_key);
-        }
+    if !api_key.is_empty() {
+        req = req.bearer_auth(api_key);
     }
     if provider == "openrouter" {
         req = req
@@ -313,14 +312,7 @@ pub async fn generate_meeting_summary_with_context(
 
     let start = Instant::now();
     let raw = transport
-        .complete(
-            &provider,
-            &model,
-            "",
-            &system,
-            &user_prompt,
-            None,
-        )
+        .complete(&provider, &model, "", &system, &user_prompt, None)
         .await?;
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -400,10 +392,7 @@ fn strip_outer_code_fence(s: &str) -> String {
         return s.to_string();
     }
     let mut body: Vec<&str> = lines.collect();
-    if body
-        .last()
-        .is_some_and(|l| l.trim().starts_with("```"))
-    {
+    if body.last().is_some_and(|l| l.trim().starts_with("```")) {
         body.pop();
     }
     body.join("\n").trim().to_string()
@@ -562,7 +551,10 @@ mod tests {
 
         let stored = db::get_summary(&pool, &mid).await.unwrap().expect("row");
         assert_eq!(stored.status, "completed");
-        assert!(stored.result.as_ref().unwrap().contains("plain") || stored.result.as_ref().unwrap().contains("TUI"));
+        assert!(
+            stored.result.as_ref().unwrap().contains("plain")
+                || stored.result.as_ref().unwrap().contains("TUI")
+        );
 
         let renamed = db::get_meeting(&pool, &mid).await.unwrap().unwrap();
         assert_eq!(renamed.title, "TUI Shipping Decision");
@@ -570,10 +562,7 @@ mod tests {
         let display = format_summary_for_display(&result);
         assert!(display.contains("TUI Shipping Decision"));
 
-        let with_ctx = format_summary_for_display_with_context(
-            &result,
-            Some(&"line\n".repeat(50)),
-        );
+        let with_ctx = format_summary_for_display_with_context(&result, Some(&"line\n".repeat(50)));
         assert!(with_ctx.contains("[+"));
         assert!(!with_ctx.contains(&"line\n".repeat(10)));
     }
@@ -587,7 +576,9 @@ mod tests {
 
     #[test]
     fn system_prompt_includes_extra_context() {
-        let p = build_system_prompt(Some("give a highly detailed transcript of this not just a summary"));
+        let p = build_system_prompt(Some(
+            "give a highly detailed transcript of this not just a summary",
+        ));
         assert!(p.contains("highly detailed"));
         assert!(p.contains("HIGHEST PRIORITY"));
         assert!(!p.to_lowercase().contains("concise paragraph"));
