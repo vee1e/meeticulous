@@ -84,7 +84,7 @@ fn which(name: &str) -> Option<PathBuf> {
 
 /// Start system audio capture into a shared mono f32 sample buffer.
 pub fn start_system_audio_capture(
-    out_samples: Arc<Mutex<Vec<f32>>>,
+    wav_writer: crate::recording::LiveWavWriter,
     stt_samples: Arc<Mutex<Vec<f32>>>,
     stop_flag: Arc<AtomicBool>,
 ) -> Result<SystemAudioSession> {
@@ -142,7 +142,7 @@ pub fn start_system_audio_capture(
     let reader = thread::Builder::new()
         .name("meeticulous-sysaudio-reader".into())
         .spawn(move || {
-            read_pcm_loop(stdout, out_samples, stt_samples, stop);
+            read_pcm_loop(stdout, wav_writer, stt_samples, stop);
         })
         .ok();
 
@@ -224,7 +224,7 @@ fn parse_kv(line: &str, key: &str) -> Option<String> {
 
 fn read_pcm_loop(
     mut stdout: impl Read,
-    out_samples: Arc<Mutex<Vec<f32>>>,
+    wav_writer: crate::recording::LiveWavWriter,
     stt_samples: Arc<Mutex<Vec<f32>>>,
     stop: Arc<AtomicBool>,
 ) {
@@ -242,14 +242,7 @@ fn read_pcm_loop(
                     let bytes: [u8; 4] = chunk.try_into().unwrap();
                     floats.push(f32::from_le_bytes(bytes));
                 }
-                if let Ok(mut g) = out_samples.lock() {
-                    g.extend_from_slice(&floats);
-                    const MAX: usize = 48_000 * 60 * 3;
-                    if g.len() > MAX {
-                        let drain = g.len() - MAX;
-                        g.drain(0..drain);
-                    }
-                }
+                crate::recording::append_wav_samples(&wav_writer, &floats);
                 if let Ok(mut feed) = stt_samples.lock() {
                     feed.extend_from_slice(&floats);
                 }

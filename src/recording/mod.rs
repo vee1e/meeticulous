@@ -8,6 +8,8 @@ use chrono::Utc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::{WavSpec, WavWriter};
 use sqlx::SqlitePool;
+use std::fs::File;
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,6 +24,9 @@ pub struct LiveSegment {
     pub audio_end: f64,
 }
 
+/// WAV file shared by audio-capture callbacks for the lifetime of a recording.
+pub(crate) type LiveWavWriter = Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>;
+
 /// Handle controlling a background recording + STT session.
 pub struct RecordingHandle {
     pub meeting_id: String,
@@ -29,9 +34,7 @@ pub struct RecordingHandle {
     pub folder_path: PathBuf,
     pub wav_path: PathBuf,
     stop_flag: Arc<AtomicBool>,
-    samples: Arc<Mutex<Vec<f32>>>,
-    sample_rate: u32,
-    channels: u16,
+    wav_writer: LiveWavWriter,
     started: Instant,
     #[allow(dead_code)]
     started_at: chrono::DateTime<Utc>,
@@ -101,10 +104,10 @@ pub async fn start_recording(
     .await?;
 
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let samples = Arc::new(Mutex::new(Vec::<f32>::new()));
     // This feed is drained by the STT worker so live transcription never has to
     // scan the recording buffer or depend on its bounded length changing.
     let stt_samples = Arc::new(Mutex::new(Vec::<f32>::new()));
+    let wav_writer: LiveWavWriter = Arc::new(Mutex::new(None));
     let live = Arc::new(Mutex::new(Vec::new()));
     let diagnostics: DiagHandle = Arc::new(Mutex::new(RecordingDiagnostics::default()));
     let pending_stt: SegmentQueue = Arc::new(Mutex::new(Vec::new()));
@@ -126,7 +129,7 @@ pub async fn start_recording(
     #[cfg(target_os = "macos")]
     let system_audio = {
         match crate::system_audio::start_system_audio_capture(
-            samples.clone(),
+            wav_writer.clone(),
             stt_samples.clone(),
             stop_flag.clone(),
         ) {
@@ -171,11 +174,11 @@ pub async fn start_recording(
     #[cfg(not(target_os = "macos"))]
     let system_up = false;
 
-    let mic_feed = if system_up {
+    let mic_wav_writer = if system_up {
         // Black-hole: open mic for status only, don't append into STT samples.
-        Arc::new(Mutex::new(Vec::<f32>::new()))
+        Arc::new(Mutex::new(None))
     } else {
-        samples.clone()
+        wav_writer.clone()
     };
     let mic_stt_feed = if system_up {
         Arc::new(Mutex::new(Vec::<f32>::new()))
@@ -183,19 +186,21 @@ pub async fn start_recording(
         stt_samples.clone()
     };
 
+    // The system-audio helper has now reported its actual sample rate. For mic-only
+    // capture the callbacks resample to the 16 kHz default above.
+    *wav_writer
+        .lock()
+        .map_err(|_| anyhow::anyhow!("WAV writer lock poisoned"))? =
+        Some(create_wav_writer(&wav_path, sample_rate, 1)?);
+
     let mic_stream = match start_cpal_capture(
-        mic_feed,
+        mic_wav_writer,
         mic_stt_feed,
         stop_flag.clone(),
         diagnostics.clone(),
         sample_rate,
     ) {
         Ok((stream, mic_sr, mic_ch)) => {
-            if !system_up {
-                sample_rate = mic_sr;
-                // Audio callbacks downmix before storing, so the STT/WAV stream is mono.
-                channels = 1;
-            }
             let _ = (mic_sr, mic_ch);
             if system_up {
                 let mut d = diagnostics.lock().unwrap();
@@ -242,9 +247,7 @@ pub async fn start_recording(
         folder_path,
         wav_path,
         stop_flag,
-        samples,
-        sample_rate,
-        channels,
+        wav_writer,
         started,
         started_at,
         live,
@@ -260,7 +263,7 @@ pub async fn start_recording(
 /// Open default mic. When `target_rate` differs from the device rate, samples are
 /// linearly resampled to `target_rate` mono so they mix cleanly with system audio.
 fn start_cpal_capture(
-    samples: Arc<Mutex<Vec<f32>>>,
+    wav_writer: LiveWavWriter,
     stt_samples: Arc<Mutex<Vec<f32>>>,
     stop_flag: Arc<AtomicBool>,
     diag: DiagHandle,
@@ -289,7 +292,7 @@ fn start_cpal_capture(
     }
 
     let capture = CaptureContext {
-        samples,
+        wav_writer,
         stt_samples,
         stop_flag,
         channels,
@@ -312,7 +315,7 @@ fn start_cpal_capture(
 
 /// Downmix + optional resample, then append into shared mono buffer.
 struct CaptureContext {
-    samples: Arc<Mutex<Vec<f32>>>,
+    wav_writer: LiveWavWriter,
     stt_samples: Arc<Mutex<Vec<f32>>>,
     stop_flag: Arc<AtomicBool>,
     channels: u16,
@@ -321,7 +324,7 @@ struct CaptureContext {
 }
 
 fn push_mixed_mono(
-    samples: &Arc<Mutex<Vec<f32>>>,
+    wav_writer: &LiveWavWriter,
     stt_samples: &Arc<Mutex<Vec<f32>>>,
     interleaved: &[f32],
     channels: u16,
@@ -334,14 +337,7 @@ fn push_mixed_mono(
     } else {
         mono
     };
-    if let Ok(mut buf) = samples.lock() {
-        buf.extend_from_slice(&mono);
-        const MAX: usize = 48_000 * 60 * 3;
-        if buf.len() > MAX {
-            let drain = buf.len() - MAX;
-            buf.drain(0..drain);
-        }
-    }
+    append_wav_samples(wav_writer, &mono);
     if let Ok(mut feed) = stt_samples.lock() {
         feed.extend_from_slice(&mono);
     }
@@ -360,7 +356,7 @@ fn build_stream_f32(
                 return;
             }
             push_mixed_mono(
-                &capture.samples,
+                &capture.wav_writer,
                 &capture.stt_samples,
                 data,
                 capture.channels,
@@ -388,7 +384,7 @@ fn build_stream_i16(
             }
             let f: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
             push_mixed_mono(
-                &capture.samples,
+                &capture.wav_writer,
                 &capture.stt_samples,
                 &f,
                 capture.channels,
@@ -419,7 +415,7 @@ fn build_stream_u16(
                 .map(|&s| (s as f32 - 32768.0) / 32768.0)
                 .collect();
             push_mixed_mono(
-                &capture.samples,
+                &capture.wav_writer,
                 &capture.stt_samples,
                 &f,
                 capture.channels,
@@ -542,35 +538,19 @@ pub async fn stop_recording(
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    let samples = handle
-        .samples
+    let writer = handle
+        .wav_writer
         .lock()
-        .map_err(|_| anyhow::anyhow!("samples lock poisoned"))?
-        .clone();
-
-    if !samples.is_empty() {
-        write_wav(
-            &handle.wav_path,
-            &samples,
-            handle.sample_rate,
-            handle.channels,
-        )?;
+        .map_err(|_| anyhow::anyhow!("WAV writer lock poisoned"))?
+        .take();
+    if let Some(writer) = writer {
+        writer.finalize()?;
         if let Ok(mut d) = handle.diagnostics.lock() {
-            d.push_log(format!(
-                "wrote WAV {} samples → {}",
-                samples.len(),
-                handle.wav_path.display()
-            ));
+            d.push_log(format!("finalized WAV {}", handle.wav_path.display()));
         }
     } else {
-        write_wav(
-            &handle.wav_path,
-            &[0.0f32; 160],
-            handle.sample_rate.max(1),
-            1,
-        )?;
         if let Ok(mut d) = handle.diagnostics.lock() {
-            d.push_log("WARN: no samples captured — wrote placeholder WAV");
+            d.push_log("WARN: WAV writer was unavailable");
         }
     }
 
@@ -601,18 +581,41 @@ pub async fn stop_recording(
     Ok(meeting)
 }
 
-fn write_wav(path: &Path, samples: &[f32], sample_rate: u32, channels: u16) -> anyhow::Result<()> {
+fn create_wav_writer(
+    path: &Path,
+    sample_rate: u32,
+    channels: u16,
+) -> anyhow::Result<WavWriter<BufWriter<File>>> {
     let spec = WavSpec {
         channels: channels.max(1),
         sample_rate: sample_rate.max(1),
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer = WavWriter::create(path, spec)?;
+    Ok(WavWriter::create(path, spec)?)
+}
+
+pub(crate) fn append_wav_samples(writer: &LiveWavWriter, samples: &[f32]) {
+    let Ok(mut guard) = writer.lock() else {
+        return;
+    };
+    let Some(writer) = guard.as_mut() else {
+        return;
+    };
     for &s in samples {
         let clipped = s.clamp(-1.0, 1.0);
         let i = (clipped * i16::MAX as f32) as i16;
-        writer.write_sample(i)?;
+        if writer.write_sample(i).is_err() {
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+fn write_wav(path: &Path, samples: &[f32], sample_rate: u32, channels: u16) -> anyhow::Result<()> {
+    let mut writer = create_wav_writer(path, sample_rate, channels)?;
+    for &sample in samples {
+        writer.write_sample((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
     }
     writer.finalize()?;
     Ok(())
