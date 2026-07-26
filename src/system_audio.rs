@@ -85,6 +85,7 @@ fn which(name: &str) -> Option<PathBuf> {
 /// Start system audio capture into a shared mono f32 sample buffer.
 pub fn start_system_audio_capture(
     out_samples: Arc<Mutex<Vec<f32>>>,
+    stt_samples: Arc<Mutex<Vec<f32>>>,
     stop_flag: Arc<AtomicBool>,
 ) -> Result<SystemAudioSession> {
     let helper = helper_path().ok_or_else(|| {
@@ -141,7 +142,7 @@ pub fn start_system_audio_capture(
     let reader = thread::Builder::new()
         .name("meeticulous-sysaudio-reader".into())
         .spawn(move || {
-            read_pcm_loop(stdout, out_samples, stop);
+            read_pcm_loop(stdout, out_samples, stt_samples, stop);
         })
         .ok();
 
@@ -221,7 +222,12 @@ fn parse_kv(line: &str, key: &str) -> Option<String> {
     None
 }
 
-fn read_pcm_loop(mut stdout: impl Read, out_samples: Arc<Mutex<Vec<f32>>>, stop: Arc<AtomicBool>) {
+fn read_pcm_loop(
+    mut stdout: impl Read,
+    out_samples: Arc<Mutex<Vec<f32>>>,
+    stt_samples: Arc<Mutex<Vec<f32>>>,
+    stop: Arc<AtomicBool>,
+) {
     let mut buf = vec![0u8; 8192 * 4];
     while !stop.load(Ordering::SeqCst) {
         match stdout.read(&mut buf) {
@@ -243,6 +249,9 @@ fn read_pcm_loop(mut stdout: impl Read, out_samples: Arc<Mutex<Vec<f32>>>, stop:
                         let drain = g.len() - MAX;
                         g.drain(0..drain);
                     }
+                }
+                if let Ok(mut feed) = stt_samples.lock() {
+                    feed.extend_from_slice(&floats);
                 }
             }
             Err(_) => break,

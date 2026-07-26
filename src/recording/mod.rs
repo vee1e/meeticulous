@@ -102,6 +102,9 @@ pub async fn start_recording(
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let samples = Arc::new(Mutex::new(Vec::<f32>::new()));
+    // This feed is drained by the STT worker so live transcription never has to
+    // scan the recording buffer or depend on its bounded length changing.
+    let stt_samples = Arc::new(Mutex::new(Vec::<f32>::new()));
     let live = Arc::new(Mutex::new(Vec::new()));
     let diagnostics: DiagHandle = Arc::new(Mutex::new(RecordingDiagnostics::default()));
     let pending_stt: SegmentQueue = Arc::new(Mutex::new(Vec::new()));
@@ -122,7 +125,11 @@ pub async fn start_recording(
 
     #[cfg(target_os = "macos")]
     let system_audio = {
-        match crate::system_audio::start_system_audio_capture(samples.clone(), stop_flag.clone()) {
+        match crate::system_audio::start_system_audio_capture(
+            samples.clone(),
+            stt_samples.clone(),
+            stop_flag.clone(),
+        ) {
             Ok(sess) => {
                 sample_rate = sess.sample_rate.max(1);
                 channels = 1; // process tap is mono
@@ -170,9 +177,15 @@ pub async fn start_recording(
     } else {
         samples.clone()
     };
+    let mic_stt_feed = if system_up {
+        Arc::new(Mutex::new(Vec::<f32>::new()))
+    } else {
+        stt_samples.clone()
+    };
 
     let mic_stream = match start_cpal_capture(
         mic_feed,
+        mic_stt_feed,
         stop_flag.clone(),
         diagnostics.clone(),
         sample_rate,
@@ -180,7 +193,8 @@ pub async fn start_recording(
         Ok((stream, mic_sr, mic_ch)) => {
             if !system_up {
                 sample_rate = mic_sr;
-                channels = mic_ch;
+                // Audio callbacks downmix before storing, so the STT/WAV stream is mono.
+                channels = 1;
             }
             let _ = (mic_sr, mic_ch);
             if system_up {
@@ -211,7 +225,7 @@ pub async fn start_recording(
 
     let started = Instant::now();
     let stt_join = spawn_stt_worker(
-        samples.clone(),
+        stt_samples,
         sample_rate,
         channels,
         stop_flag.clone(),
@@ -247,6 +261,7 @@ pub async fn start_recording(
 /// linearly resampled to `target_rate` mono so they mix cleanly with system audio.
 fn start_cpal_capture(
     samples: Arc<Mutex<Vec<f32>>>,
+    stt_samples: Arc<Mutex<Vec<f32>>>,
     stop_flag: Arc<AtomicBool>,
     diag: DiagHandle,
     target_rate: u32,
@@ -278,6 +293,7 @@ fn start_cpal_capture(
             &device,
             &stream_config,
             samples,
+            stt_samples,
             stop_flag,
             channels,
             sample_rate,
@@ -287,6 +303,7 @@ fn start_cpal_capture(
             &device,
             &stream_config,
             samples,
+            stt_samples,
             stop_flag,
             channels,
             sample_rate,
@@ -296,6 +313,7 @@ fn start_cpal_capture(
             &device,
             &stream_config,
             samples,
+            stt_samples,
             stop_flag,
             channels,
             sample_rate,
@@ -314,6 +332,7 @@ fn start_cpal_capture(
 /// Downmix + optional resample, then append into shared mono buffer.
 fn push_mixed_mono(
     samples: &Arc<Mutex<Vec<f32>>>,
+    stt_samples: &Arc<Mutex<Vec<f32>>>,
     interleaved: &[f32],
     channels: u16,
     from_rate: u32,
@@ -326,8 +345,6 @@ fn push_mixed_mono(
         mono
     };
     if let Ok(mut buf) = samples.lock() {
-        // Soft-mix: additive blend so mic speech sits on top of system audio.
-        // When buffer is empty or system is quiet, just append.
         buf.extend_from_slice(&mono);
         const MAX: usize = 48_000 * 60 * 3;
         if buf.len() > MAX {
@@ -335,12 +352,16 @@ fn push_mixed_mono(
             buf.drain(0..drain);
         }
     }
+    if let Ok(mut feed) = stt_samples.lock() {
+        feed.extend_from_slice(&mono);
+    }
 }
 
 fn build_stream_f32(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     samples: Arc<Mutex<Vec<f32>>>,
+    stt_samples: Arc<Mutex<Vec<f32>>>,
     stop_flag: Arc<AtomicBool>,
     channels: u16,
     from_rate: u32,
@@ -353,7 +374,7 @@ fn build_stream_f32(
             if stop_flag.load(Ordering::Relaxed) {
                 return;
             }
-            push_mixed_mono(&samples, data, channels, from_rate, to_rate);
+            push_mixed_mono(&samples, &stt_samples, data, channels, from_rate, to_rate);
         },
         err_fn,
         None,
@@ -365,6 +386,7 @@ fn build_stream_i16(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     samples: Arc<Mutex<Vec<f32>>>,
+    stt_samples: Arc<Mutex<Vec<f32>>>,
     stop_flag: Arc<AtomicBool>,
     channels: u16,
     from_rate: u32,
@@ -378,7 +400,7 @@ fn build_stream_i16(
                 return;
             }
             let f: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-            push_mixed_mono(&samples, &f, channels, from_rate, to_rate);
+            push_mixed_mono(&samples, &stt_samples, &f, channels, from_rate, to_rate);
         },
         err_fn,
         None,
@@ -390,6 +412,7 @@ fn build_stream_u16(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     samples: Arc<Mutex<Vec<f32>>>,
+    stt_samples: Arc<Mutex<Vec<f32>>>,
     stop_flag: Arc<AtomicBool>,
     channels: u16,
     from_rate: u32,
@@ -406,7 +429,7 @@ fn build_stream_u16(
                 .iter()
                 .map(|&s| (s as f32 - 32768.0) / 32768.0)
                 .collect();
-            push_mixed_mono(&samples, &f, channels, from_rate, to_rate);
+            push_mixed_mono(&samples, &stt_samples, &f, channels, from_rate, to_rate);
         },
         err_fn,
         None,

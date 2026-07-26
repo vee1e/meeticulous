@@ -387,8 +387,6 @@ fn stt_worker_loop(
 
     let mut cursor: usize = 0; // index into mono sample history (device rate, mono)
     let mut mono_history: Vec<f32> = Vec::new();
-    // Snapshot length of capture buffer last time we pulled (detect ring drain)
-    let mut last_buf_len: usize = 0;
     let mut absolute_mono_offset: u64 = 0; // total mono samples ever (for timestamps)
 
     let chunk_secs = 3.0f32;
@@ -397,19 +395,13 @@ fn stt_worker_loop(
     let ch = channels.max(1) as usize;
 
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-        // Pull capture buffer snapshot. If len shrank, ring was drained — resync.
-        let buf_snapshot = samples.lock().unwrap().clone();
-        if buf_snapshot.len() < last_buf_len {
-            // Buffer drained from the front; keep mono_history, start consuming from end.
-            last_buf_len = 0;
-            {
-                let mut d = diag.lock().unwrap();
-                d.push_log("capture buffer rotated — resyncing audio cursor");
-            }
-        }
-        if buf_snapshot.len() > last_buf_len {
-            let new_interleaved = &buf_snapshot[last_buf_len..];
-            last_buf_len = buf_snapshot.len();
+        // Drain the incremental feed atomically. A bounded buffer whose length stays
+        // constant must not be mistaken for a feed with no new audio.
+        let new_interleaved = {
+            let mut pending = samples.lock().unwrap();
+            std::mem::take(&mut *pending)
+        };
+        if !new_interleaved.is_empty() {
             let usable = new_interleaved.len() - (new_interleaved.len() % ch);
             if usable > 0 {
                 let mono = downmix_interleaved(&new_interleaved[..usable], channels);
