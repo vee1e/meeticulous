@@ -288,37 +288,18 @@ fn start_cpal_capture(
         ));
     }
 
+    let capture = CaptureContext {
+        samples,
+        stt_samples,
+        stop_flag,
+        channels,
+        from_rate: sample_rate,
+        to_rate: target_rate,
+    };
     let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => build_stream_f32(
-            &device,
-            &stream_config,
-            samples,
-            stt_samples,
-            stop_flag,
-            channels,
-            sample_rate,
-            target_rate,
-        )?,
-        cpal::SampleFormat::I16 => build_stream_i16(
-            &device,
-            &stream_config,
-            samples,
-            stt_samples,
-            stop_flag,
-            channels,
-            sample_rate,
-            target_rate,
-        )?,
-        cpal::SampleFormat::U16 => build_stream_u16(
-            &device,
-            &stream_config,
-            samples,
-            stt_samples,
-            stop_flag,
-            channels,
-            sample_rate,
-            target_rate,
-        )?,
+        cpal::SampleFormat::F32 => build_stream_f32(&device, &stream_config, capture)?,
+        cpal::SampleFormat::I16 => build_stream_i16(&device, &stream_config, capture)?,
+        cpal::SampleFormat::U16 => build_stream_u16(&device, &stream_config, capture)?,
         other => anyhow::bail!("unsupported sample format: {other:?}"),
     };
     stream.play()?;
@@ -330,6 +311,15 @@ fn start_cpal_capture(
 }
 
 /// Downmix + optional resample, then append into shared mono buffer.
+struct CaptureContext {
+    samples: Arc<Mutex<Vec<f32>>>,
+    stt_samples: Arc<Mutex<Vec<f32>>>,
+    stop_flag: Arc<AtomicBool>,
+    channels: u16,
+    from_rate: u32,
+    to_rate: u32,
+}
+
 fn push_mixed_mono(
     samples: &Arc<Mutex<Vec<f32>>>,
     stt_samples: &Arc<Mutex<Vec<f32>>>,
@@ -360,21 +350,23 @@ fn push_mixed_mono(
 fn build_stream_f32(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    samples: Arc<Mutex<Vec<f32>>>,
-    stt_samples: Arc<Mutex<Vec<f32>>>,
-    stop_flag: Arc<AtomicBool>,
-    channels: u16,
-    from_rate: u32,
-    to_rate: u32,
+    capture: CaptureContext,
 ) -> anyhow::Result<cpal::Stream> {
     let err_fn = |e| log::error!("audio stream error: {e}");
     let stream = device.build_input_stream(
         config,
         move |data: &[f32], _| {
-            if stop_flag.load(Ordering::Relaxed) {
+            if capture.stop_flag.load(Ordering::Relaxed) {
                 return;
             }
-            push_mixed_mono(&samples, &stt_samples, data, channels, from_rate, to_rate);
+            push_mixed_mono(
+                &capture.samples,
+                &capture.stt_samples,
+                data,
+                capture.channels,
+                capture.from_rate,
+                capture.to_rate,
+            );
         },
         err_fn,
         None,
@@ -385,22 +377,24 @@ fn build_stream_f32(
 fn build_stream_i16(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    samples: Arc<Mutex<Vec<f32>>>,
-    stt_samples: Arc<Mutex<Vec<f32>>>,
-    stop_flag: Arc<AtomicBool>,
-    channels: u16,
-    from_rate: u32,
-    to_rate: u32,
+    capture: CaptureContext,
 ) -> anyhow::Result<cpal::Stream> {
     let err_fn = |e| log::error!("audio stream error: {e}");
     let stream = device.build_input_stream(
         config,
         move |data: &[i16], _| {
-            if stop_flag.load(Ordering::Relaxed) {
+            if capture.stop_flag.load(Ordering::Relaxed) {
                 return;
             }
             let f: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-            push_mixed_mono(&samples, &stt_samples, &f, channels, from_rate, to_rate);
+            push_mixed_mono(
+                &capture.samples,
+                &capture.stt_samples,
+                &f,
+                capture.channels,
+                capture.from_rate,
+                capture.to_rate,
+            );
         },
         err_fn,
         None,
@@ -411,25 +405,27 @@ fn build_stream_i16(
 fn build_stream_u16(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    samples: Arc<Mutex<Vec<f32>>>,
-    stt_samples: Arc<Mutex<Vec<f32>>>,
-    stop_flag: Arc<AtomicBool>,
-    channels: u16,
-    from_rate: u32,
-    to_rate: u32,
+    capture: CaptureContext,
 ) -> anyhow::Result<cpal::Stream> {
     let err_fn = |e| log::error!("audio stream error: {e}");
     let stream = device.build_input_stream(
         config,
         move |data: &[u16], _| {
-            if stop_flag.load(Ordering::Relaxed) {
+            if capture.stop_flag.load(Ordering::Relaxed) {
                 return;
             }
             let f: Vec<f32> = data
                 .iter()
                 .map(|&s| (s as f32 - 32768.0) / 32768.0)
                 .collect();
-            push_mixed_mono(&samples, &stt_samples, &f, channels, from_rate, to_rate);
+            push_mixed_mono(
+                &capture.samples,
+                &capture.stt_samples,
+                &f,
+                capture.channels,
+                capture.from_rate,
+                capture.to_rate,
+            );
         },
         err_fn,
         None,
