@@ -123,12 +123,15 @@ pub async fn start_recording(
     }
 
     // --- System audio first (Zoom/Meet/etc), then mic as secondary mix ---
+    // WAV is written live (unbounded) as samples arrive — never a rolling
+    // in-memory window. That old 3-minute drain was the source of truncated files.
     let mut sample_rate: u32 = 16_000;
     let mut channels: u16 = 1;
 
     #[cfg(target_os = "macos")]
     let system_audio = {
         match crate::system_audio::start_system_audio_capture(
+            &wav_path,
             wav_writer.clone(),
             stt_samples.clone(),
             stop_flag.clone(),
@@ -146,6 +149,10 @@ pub async fn start_recording(
                     sess.device_name, sample_rate
                 ));
                 d.push_log("capturing what your Mac plays (Zoom/Meet/browser) — not just the mic");
+                d.push_log(format!(
+                    "live WAV open at {} (full session, no duration cap)",
+                    wav_path.display()
+                ));
                 Some(sess)
             }
             Err(e) => {
@@ -175,9 +182,21 @@ pub async fn start_recording(
     let system_up = false;
 
     let mic_wav_writer = if system_up {
-        // Black-hole: open mic for status only, don't append into STT samples.
+        // Black-hole: open mic for status only, don't append into the meeting WAV.
         Arc::new(Mutex::new(None))
     } else {
+        // Mic-only path: open the live WAV before the capture stream starts.
+        *wav_writer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("WAV writer lock poisoned"))? =
+            Some(create_wav_writer(&wav_path, sample_rate, 1)?);
+        if let Ok(mut d) = diagnostics.lock() {
+            d.push_log(format!(
+                "live WAV open at {} @ {} Hz (mic-only, no duration cap)",
+                wav_path.display(),
+                sample_rate
+            ));
+        }
         wav_writer.clone()
     };
     let mic_stt_feed = if system_up {
@@ -185,13 +204,6 @@ pub async fn start_recording(
     } else {
         stt_samples.clone()
     };
-
-    // The system-audio helper has now reported its actual sample rate. For mic-only
-    // capture the callbacks resample to the 16 kHz default above.
-    *wav_writer
-        .lock()
-        .map_err(|_| anyhow::anyhow!("WAV writer lock poisoned"))? =
-        Some(create_wav_writer(&wav_path, sample_rate, 1)?);
 
     let mic_stream = match start_cpal_capture(
         mic_wav_writer,
@@ -581,7 +593,7 @@ pub async fn stop_recording(
     Ok(meeting)
 }
 
-fn create_wav_writer(
+pub(crate) fn create_wav_writer(
     path: &Path,
     sample_rate: u32,
     channels: u16,
@@ -592,9 +604,13 @@ fn create_wav_writer(
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    Ok(WavWriter::create(path, spec)?)
+    // Larger buffer: audio callbacks append continuously for long meetings.
+    let file = File::create(path)?;
+    let buffered = BufWriter::with_capacity(256 * 1024, file);
+    Ok(WavWriter::new(buffered, spec)?)
 }
 
+/// Append mono f32 samples to the live meeting WAV. Unbounded — no rolling cap.
 pub(crate) fn append_wav_samples(writer: &LiveWavWriter, samples: &[f32]) {
     let Ok(mut guard) = writer.lock() else {
         return;
@@ -687,6 +703,48 @@ mod tests {
     use super::*;
     use crate::db::{list_meetings, load_transcript_text, open_database};
     use crate::paths::MeetilyPaths;
+
+    /// Regression: the old in-memory capture buffer drained to a 3-minute rolling
+    /// window (`48_000 * 60 * 3`). Live WAV append must keep the full session.
+    #[test]
+    fn live_wav_writer_keeps_more_than_three_minutes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("long.wav");
+        let sample_rate = 48_000u32;
+        // 3 minutes + 30 seconds of mono silence (as i16 frames via f32).
+        let total_secs = 210u32;
+        let total_samples = sample_rate as usize * total_secs as usize;
+
+        let writer: LiveWavWriter = Arc::new(Mutex::new(Some(
+            create_wav_writer(&path, sample_rate, 1).unwrap(),
+        )));
+
+        // Append in chunks to mimic the capture callback.
+        let chunk = vec![0.1f32; sample_rate as usize]; // 1s
+        for _ in 0..total_secs {
+            append_wav_samples(&writer, &chunk);
+        }
+
+        let w = writer.lock().unwrap().take().unwrap();
+        w.finalize().unwrap();
+
+        let reader = hound::WavReader::open(&path).unwrap();
+        let spec = reader.spec();
+        assert_eq!(spec.sample_rate, sample_rate);
+        assert_eq!(spec.channels, 1);
+        let n = reader.len() as usize;
+        assert_eq!(
+            n, total_samples,
+            "expected {total_secs}s of audio, got {:.1}s (still capped?)",
+            n as f64 / sample_rate as f64
+        );
+        // Explicitly beyond the historical 3-minute bug.
+        assert!(
+            n > sample_rate as usize * 180,
+            "WAV must exceed 3 minutes; got {:.1}s",
+            n as f64 / sample_rate as f64
+        );
+    }
 
     #[tokio::test]
     async fn start_stop_recording_appends_segments_to_db() {

@@ -534,18 +534,32 @@ fn levels_only_loop(
     stop: &Arc<std::sync::atomic::AtomicBool>,
     diag: &DiagHandle,
 ) {
+    // Keep only a short ring for metering. The meeting WAV is written separately
+    // and must not depend on this feed's length.
+    let mut ring: Vec<f32> = Vec::new();
+    let max_ring = (sample_rate.max(1) as usize).saturating_mul(2); // ~2s mono
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-        let buf = samples.lock().unwrap().clone();
-        let mono = downmix_interleaved(&buf, channels);
-        let window = mono
+        let chunk = {
+            let mut pending = samples.lock().unwrap();
+            std::mem::take(&mut *pending)
+        };
+        if !chunk.is_empty() {
+            let mono = downmix_interleaved(&chunk, channels);
+            ring.extend_from_slice(&mono);
+            if ring.len() > max_ring {
+                let drop_n = ring.len() - max_ring;
+                ring.drain(0..drop_n);
+            }
+        }
+        let window = ring
             .len()
             .saturating_sub(((sample_rate as f32) * 0.25) as usize);
-        let recent = &mono[window..];
+        let recent = &ring[window..];
         let (rms, peak) = compute_rms_peak(recent);
         {
             let mut d = diag.lock().unwrap();
-            d.buffer_samples = mono.len();
-            d.buffer_secs = mono.len() as f32 / sample_rate.max(1) as f32;
+            d.buffer_samples = ring.len();
+            d.buffer_secs = ring.len() as f32 / sample_rate.max(1) as f32;
             d.rms = rms;
             d.peak = peak;
             d.level_db = rms_to_db(rms);

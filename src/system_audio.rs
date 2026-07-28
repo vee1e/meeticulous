@@ -82,8 +82,13 @@ fn which(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Start system audio capture into a shared mono f32 sample buffer.
+/// Start system audio capture, streaming PCM into the live WAV + STT feed.
+///
+/// Opens `wav_writer` for `wav_path` **after** the helper reports its sample rate
+/// and **before** the PCM reader thread starts, so no audio is dropped and the
+/// full meeting is written (not a rolling in-memory window).
 pub fn start_system_audio_capture(
+    wav_path: &Path,
     wav_writer: crate::recording::LiveWavWriter,
     stt_samples: Arc<Mutex<Vec<f32>>>,
     stop_flag: Arc<AtomicBool>,
@@ -113,6 +118,18 @@ pub fn start_system_audio_capture(
     let mut stderr_reader = BufReader::new(stderr);
 
     let (sample_rate, device_name) = wait_ready(&mut stderr_reader, &mut child, &helper)?;
+
+    // Install the WAV writer before any PCM is read so the full session is saved.
+    {
+        let mut guard = wav_writer
+            .lock()
+            .map_err(|_| anyhow!("WAV writer lock poisoned"))?;
+        *guard = Some(crate::recording::create_wav_writer(
+            wav_path,
+            sample_rate.max(1),
+            1,
+        )?);
+    }
 
     // Drain remaining stderr into logs on a side thread
     let stop_err = stop_flag.clone();
