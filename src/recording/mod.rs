@@ -734,7 +734,8 @@ mod tests {
         assert_eq!(spec.channels, 1);
         let n = reader.len() as usize;
         assert_eq!(
-            n, total_samples,
+            n,
+            total_samples,
             "expected {total_secs}s of audio, got {:.1}s (still capped?)",
             n as f64 / sample_rate as f64
         );
