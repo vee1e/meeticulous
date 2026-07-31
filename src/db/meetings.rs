@@ -64,11 +64,21 @@ pub async fn update_meeting_title(
 
 /// Touch updated_at.
 pub async fn touch_meeting(pool: &SqlitePool, meeting_id: &str) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    touch_meeting_in_tx(&mut tx, meeting_id).await?;
+    tx.commit().await
+}
+
+/// Touch updated_at within an open transaction.
+pub(super) async fn touch_meeting_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    meeting_id: &str,
+) -> Result<(), sqlx::Error> {
     let now = Utc::now().to_rfc3339();
     sqlx::query("UPDATE meetings SET updated_at = ? WHERE id = ?")
         .bind(now)
         .bind(meeting_id)
-        .execute(pool)
+        .execute(&mut **tx)
         .await?;
     Ok(())
 }

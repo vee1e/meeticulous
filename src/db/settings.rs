@@ -93,6 +93,14 @@ pub async fn get_api_key_for_provider(
         _ => return Ok(None),
     };
     let q = format!("SELECT {} FROM settings WHERE id = '1' LIMIT 1", col);
-    let key: Option<Option<String>> = sqlx::query_scalar(&q).fetch_optional(pool).await?;
+    let key: Option<Option<String>> = match sqlx::query_scalar(&q).fetch_optional(pool).await {
+        Ok(k) => k,
+        Err(e) if is_no_such_column(&e) => None,
+        Err(e) => return Err(e),
+    };
     Ok(key.flatten())
+}
+
+fn is_no_such_column(err: &sqlx::Error) -> bool {
+    matches!(err, sqlx::Error::Database(db) if db.message().contains("no such column"))
 }

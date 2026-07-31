@@ -4,7 +4,8 @@ use ort::execution_providers::CPUExecutionProvider;
 use ort::inputs;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
-use ort::value::TensorRef;
+use ort::tensor::TensorElementType;
+use ort::value::{TensorRef, ValueType};
 use regex::Regex;
 
 use std::fs;
@@ -50,6 +51,12 @@ pub struct ParakeetModel {
     vocab: Vec<String>,
     blank_idx: i32,
     vocab_size: usize,
+    decoder_output_width: usize,
+    decoder_enc_input_rank: usize,
+    decoder_enc_hidden_axis: usize,
+    decoder_enc_hidden_size: Option<usize>,
+    enc_scratch: ArrayD<f32>,
+    enc_hidden_marker: Option<usize>,
 }
 
 impl Drop for ParakeetModel {
@@ -61,19 +68,133 @@ impl Drop for ParakeetModel {
     }
 }
 
+fn tensor_type_and_shape<'a>(
+    name: &str,
+    vt: &'a ValueType,
+) -> Result<(&'a [i64], TensorElementType), ParakeetError> {
+    match vt {
+        ValueType::Tensor { ty, shape, .. } => Ok((shape, *ty)),
+        other => Err(ParakeetError::TensorShape(format!(
+            "{name} is not a tensor: {other}"
+        ))),
+    }
+}
+
+fn hidden_axis_and_size(shape: &[i64]) -> (usize, Option<usize>) {
+    let mut best: Option<(usize, i64)> = None;
+    for (i, &d) in shape.iter().enumerate() {
+        if d > 1 && best.map_or(true, |(_, b)| d > b) {
+            best = Some((i, d));
+        }
+    }
+    match best {
+        Some((i, d)) => (i, Some(d as usize)),
+        None => (shape.len().saturating_sub(1), None),
+    }
+}
+
 impl ParakeetModel {
     pub fn new<P: AsRef<Path>>(model_dir: P, quantized: bool) -> Result<Self, ParakeetError> {
-        let encoder = Self::init_session(&model_dir, "encoder-model", None, quantized)?;
-        let decoder_joint = Self::init_session(&model_dir, "decoder_joint-model", None, quantized)?;
-        let preprocessor = Self::init_session(&model_dir, "nemo128", None, false)?;
+        let encoder = Self::init_session(&model_dir, "encoder-model", Some(1), quantized)?;
+        let decoder_joint =
+            Self::init_session(&model_dir, "decoder_joint-model", Some(1), quantized)?;
+        let preprocessor = Self::init_session(&model_dir, "nemo128", Some(1), false)?;
 
         let (vocab, blank_idx) = Self::load_vocab(&model_dir)?;
         let vocab_size = vocab.len();
 
+        let (dec_enc_shape, dec_enc_dtype) = {
+            let input = decoder_joint
+                .inputs
+                .iter()
+                .find(|i| i.name == "encoder_outputs")
+                .ok_or_else(|| ParakeetError::InputNotFound("encoder_outputs".to_string()))?;
+            tensor_type_and_shape("decoder 'encoder_outputs'", &input.input_type)?
+        };
+        let decoder_enc_input_rank = dec_enc_shape.len();
+        if decoder_enc_input_rank != 3 {
+            return Err(ParakeetError::TensorShape(format!(
+                "decoder 'encoder_outputs' input has rank {decoder_enc_input_rank} (expected 3, batch×time×hidden): {dec_enc_shape:?}"
+            )));
+        }
+        let (decoder_enc_hidden_axis, decoder_enc_hidden_size) =
+            hidden_axis_and_size(dec_enc_shape);
+        if decoder_enc_hidden_axis != 2 {
+            return Err(ParakeetError::TensorShape(format!(
+                "decoder 'encoder_outputs' input shape {dec_enc_shape:?} is not [batch, time, hidden]; hidden must be the last axis"
+            )));
+        }
+        for (i, &d) in dec_enc_shape.iter().enumerate() {
+            if i != decoder_enc_hidden_axis && d > 1 {
+                return Err(ParakeetError::TensorShape(format!(
+                    "decoder 'encoder_outputs' input shape {dec_enc_shape:?} pins dim {i} to {d}; per-step decode requires batch/time = 1"
+                )));
+            }
+        }
+
+        let (enc_out_shape, enc_out_dtype) = {
+            let output = encoder
+                .outputs
+                .iter()
+                .find(|o| o.name == "outputs")
+                .ok_or_else(|| ParakeetError::OutputNotFound("outputs".to_string()))?;
+            tensor_type_and_shape("encoder 'outputs'", &output.output_type)?
+        };
+        if enc_out_shape.len() != decoder_enc_input_rank {
+            return Err(ParakeetError::TensorShape(format!(
+                "encoder output has rank {} but decoder 'encoder_outputs' expects rank {decoder_enc_input_rank}: {enc_out_shape:?} vs {dec_enc_shape:?}",
+                enc_out_shape.len()
+            )));
+        }
+        if enc_out_dtype != dec_enc_dtype {
+            return Err(ParakeetError::TensorShape(format!(
+                "encoder output dtype {enc_out_dtype:?} != decoder 'encoder_outputs' input dtype {dec_enc_dtype:?}"
+            )));
+        }
+        if let Some(hidden) = decoder_enc_hidden_size {
+            if !enc_out_shape.contains(&(hidden as i64)) {
+                return Err(ParakeetError::TensorShape(format!(
+                    "encoder output shape {enc_out_shape:?} has no hidden dim of size {hidden} required by decoder 'encoder_outputs' input {dec_enc_shape:?}"
+                )));
+            }
+        }
+        let enc_hidden_marker = enc_out_shape
+            .iter()
+            .copied()
+            .filter(|&d| d > 1)
+            .max()
+            .map(|d| d as usize);
+
+        let (dec_out_shape, _) = {
+            let output = decoder_joint
+                .outputs
+                .iter()
+                .find(|o| o.name == "outputs")
+                .ok_or_else(|| ParakeetError::OutputNotFound("outputs".to_string()))?;
+            tensor_type_and_shape("decoder 'outputs'", &output.output_type)?
+        };
+        let decoder_output_width = dec_out_shape
+            .last()
+            .copied()
+            .filter(|&d| d >= 0)
+            .map(|d| d as usize)
+            .unwrap_or(0);
+        if decoder_output_width > 0 && decoder_output_width < vocab_size {
+            return Err(ParakeetError::TensorShape(format!(
+                "vocab.txt declares {vocab_size} tokens but the decoder emits only {decoder_output_width} logits per frame; TDT duration split would be wrong (decoder 'outputs' shape {dec_out_shape:?})"
+            )));
+        }
+
+        let mut enc_dims = vec![1usize; decoder_enc_input_rank];
+        enc_dims[decoder_enc_hidden_axis] = decoder_enc_hidden_size.unwrap_or(1).max(1);
+        let enc_scratch = ArrayD::zeros(IxDyn(&enc_dims));
+
         log::info!(
-            "Loaded Parakeet vocabulary with {} tokens, blank_idx={}",
+            "Loaded Parakeet vocabulary with {} tokens, blank_idx={}, decoder output width {} (TDT: {})",
             vocab_size,
-            blank_idx
+            blank_idx,
+            decoder_output_width,
+            decoder_output_width > vocab_size
         );
 
         Ok(Self {
@@ -83,6 +204,12 @@ impl ParakeetModel {
             vocab,
             blank_idx,
             vocab_size,
+            decoder_output_width,
+            decoder_enc_input_rank,
+            decoder_enc_hidden_axis,
+            decoder_enc_hidden_size,
+            enc_scratch,
+            enc_hidden_marker,
         })
     }
 
@@ -220,15 +347,50 @@ impl ParakeetModel {
         let encoder_output = outputs
             .get("outputs")
             .ok_or_else(|| ParakeetError::OutputNotFound("outputs".to_string()))?
-            .try_extract_array()?;
+            .try_extract_array()?
+            .to_owned();
         let encoded_lengths = outputs
             .get("encoded_lengths")
             .ok_or_else(|| ParakeetError::OutputNotFound("encoded_lengths".to_string()))?
-            .try_extract_array()?;
+            .try_extract_array()?
+            .to_owned();
+        drop(outputs);
 
-        let encoder_output = encoder_output.permuted_axes(IxDyn(&[0, 2, 1]));
+        let encoder_output = self.normalize_enc_layout(encoder_output)?;
 
-        Ok((encoder_output.to_owned(), encoded_lengths.to_owned()))
+        Ok((encoder_output, encoded_lengths))
+    }
+
+    fn normalize_enc_layout(
+        &self,
+        encoder_output: ArrayD<f32>,
+    ) -> Result<ArrayD<f32>, ParakeetError> {
+        if encoder_output.ndim() != self.decoder_enc_input_rank {
+            return Err(ParakeetError::TensorShape(format!(
+                "encoder output has rank {} but decoder expects rank {}: shape {:?}",
+                encoder_output.ndim(),
+                self.decoder_enc_input_rank,
+                encoder_output.shape()
+            )));
+        }
+        // FastConformer exports emit either [batch, time, hidden] or [batch,
+        // hidden, time]; normalize to [batch, time, hidden] so decode_sequence
+        // can slice along the time axis. The hidden size is the one the
+        // decoder's 'encoder_outputs' input metadata pins down (falling back to
+        // the encoder's own static output dim when that is fully dynamic).
+        let Some(hidden) = self.decoder_enc_hidden_size.or(self.enc_hidden_marker) else {
+            return Ok(encoder_output);
+        };
+        let shape = encoder_output.shape();
+        if shape[2] == hidden {
+            Ok(encoder_output)
+        } else if shape[1] == hidden {
+            Ok(encoder_output.permuted_axes(IxDyn(&[0, 2, 1])))
+        } else {
+            Err(ParakeetError::TensorShape(format!(
+                "encoder output shape {shape:?} does not put the decoder's hidden size {hidden} on the time or hidden axis"
+            )))
+        }
     }
 
     pub fn create_decoder_state(&self) -> Result<DecoderState, ParakeetError> {
@@ -251,44 +413,70 @@ impl ParakeetModel {
             .tensor_shape()
             .ok_or_else(|| ParakeetError::TensorShape("input_states_2".to_string()))?;
 
-        // Create zero states with batch_size=1
-        // Shape is [2, -1, 640] so we use [2, 1, 640] for batch_size=1
-        let state1 = Array::zeros((
-            state1_shape[0] as usize,
-            1, // batch_size = 1
-            state1_shape[2] as usize,
-        ));
-
-        let state2 = Array::zeros((
-            state2_shape[0] as usize,
-            1, // batch_size = 1
-            state2_shape[2] as usize,
-        ));
+        let state1 = Self::zero_decoder_state("input_states_1", state1_shape)?;
+        let state2 = Self::zero_decoder_state("input_states_2", state2_shape)?;
 
         Ok((state1, state2))
+    }
+
+    fn zero_decoder_state(name: &str, shape: &[i64]) -> Result<Array3<f32>, ParakeetError> {
+        if shape.len() != 3 {
+            return Err(ParakeetError::TensorShape(format!(
+                "{name} has rank {} (expected 3): {shape:?}",
+                shape.len()
+            )));
+        }
+        let d0 = shape[0];
+        let d2 = shape[2];
+        if d0 < 0 || d2 < 0 {
+            return Err(ParakeetError::TensorShape(format!(
+                "{name} has dynamic non-batch dims {shape:?}; cannot build a zero decoder state"
+            )));
+        }
+        Ok(Array::zeros((d0 as usize, 1, d2 as usize)))
     }
 
     pub fn decode_step(
         &mut self,
         prev_tokens: &[i32],
         prev_state: &DecoderState,
-        encoder_out: &ArrayViewD<f32>, // [time_steps, 1024]
+        encoder_out: &ArrayViewD<f32>, // [hidden] — a single encoding timestep
     ) -> Result<(ArrayD<f32>, DecoderState), ParakeetError> {
         log::trace!("Running Parakeet decoder inference...");
 
         // Get last token or blank_idx if empty
         let target_token = prev_tokens.last().copied().unwrap_or(self.blank_idx);
 
-        // Prepare inputs matching Python: encoder_out[None, :, None] -> [1, time_steps, 1]
-        let encoder_outputs = encoder_out
-            .to_owned()
-            .insert_axis(ndarray::Axis(0))
-            .insert_axis(ndarray::Axis(2));
+        // Build encoder_outputs to exactly match the decoder's expected input
+        // layout ([batch=1, time=1, hidden]) derived from session metadata,
+        // reusing a scratch buffer instead of allocating per timestep.
+        let features = encoder_out.len();
+        if let Some(hidden) = self.decoder_enc_hidden_size {
+            if features != hidden {
+                return Err(ParakeetError::TensorShape(format!(
+                    "encoder timestep has {features} features but decoder 'encoder_outputs' expects {hidden}"
+                )));
+            }
+        }
+        if self.enc_scratch.len() != features {
+            let mut dims = vec![1usize; self.decoder_enc_input_rank];
+            dims[self.decoder_enc_hidden_axis] = features;
+            self.enc_scratch = ArrayD::zeros(IxDyn(&dims));
+        }
+        let shape_err = || {
+            ParakeetError::Shape(ndarray::ShapeError::from_kind(
+                ndarray::ErrorKind::IncompatibleShape,
+            ))
+        };
+        let src = encoder_out.as_slice().ok_or_else(shape_err)?;
+        let dst = self.enc_scratch.as_slice_mut().ok_or_else(shape_err)?;
+        dst.copy_from_slice(src);
+
         let targets = Array2::from_shape_vec((1, 1), vec![target_token])?;
-        let target_length = Array1::from_vec(vec![1]);
+        let target_length = Array1::<i64>::from_vec(vec![1]);
 
         let inputs = inputs![
-            "encoder_outputs" => TensorRef::from_array_view(encoder_outputs.view())?,
+            "encoder_outputs" => TensorRef::from_array_view(self.enc_scratch.view())?,
             "targets" => TensorRef::from_array_view(targets.view())?,
             "target_length" => TensorRef::from_array_view(target_length.view())?,
             "input_states_1" => TensorRef::from_array_view(prev_state.0.view())?,
@@ -349,9 +537,18 @@ impl ParakeetModel {
 
     fn decode_sequence(
         &mut self,
-        encodings: &ArrayViewD<f32>, // [time_steps, 1024]
+        encodings: &ArrayViewD<f32>, // [time_steps, hidden]
         encodings_len: usize,
     ) -> Result<(Vec<i32>, Vec<usize>), ParakeetError> {
+        if encodings.ndim() != 2 {
+            return Err(ParakeetError::TensorShape(format!(
+                "decode_sequence got encodings with rank {} (expected 2, time×hidden): shape {:?}",
+                encodings.ndim(),
+                encodings.shape()
+            )));
+        }
+        let encodings_len = encodings_len.min(encodings.shape()[0]);
+
         let mut prev_state = self.create_decoder_state()?;
         let mut tokens = Vec::new();
         let mut timestamps = Vec::new();
@@ -361,10 +558,19 @@ impl ParakeetModel {
 
         while t < encodings_len {
             let encoder_step = encodings.slice(ndarray::s![t, ..]);
-            // Convert to dynamic dimension to match decode_step parameter type
-            let encoder_step_dyn = encoder_step.to_owned().into_dyn();
             let (probs, new_state) =
-                self.decode_step(&tokens, &prev_state, &encoder_step_dyn.view())?;
+                self.decode_step(&tokens, &prev_state, &encoder_step.into_dyn())?;
+
+            if probs.len() < self.vocab_size
+                || (self.decoder_output_width > 0 && probs.len() != self.decoder_output_width)
+            {
+                return Err(ParakeetError::TensorShape(format!(
+                    "decoder emitted {} logits but vocab.txt declares {} tokens (decoder output width {} from session metadata); TDT duration split would be wrong",
+                    probs.len(),
+                    self.vocab_size,
+                    self.decoder_output_width
+                )));
+            }
 
             // For TDT models, split output into vocab logits and duration logits
             // output[:vocab_size] = vocabulary logits

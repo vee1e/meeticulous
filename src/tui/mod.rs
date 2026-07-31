@@ -119,6 +119,7 @@ pub struct App {
     scroll: u16,
     /// Last content area height (for page scroll).
     content_height: u16,
+    content_width: u16,
     /// Pending `g` for vim `gg` (go top).
     pending_g: bool,
     /// When true, live transcript sticks to the bottom as new lines arrive.
@@ -171,6 +172,7 @@ impl App {
             summary_model_label: String::new(),
             scroll: 0,
             content_height: 20,
+            content_width: 80,
             pending_g: false,
             live_follow: true,
             summary_wrapped_len: 0,
@@ -254,8 +256,11 @@ impl App {
     }
 
     fn scroll_content_len(&self) -> u16 {
+        let wrap_width = self.content_width.max(1) as usize;
         match self.screen {
-            Screen::Transcript => self.transcript_text.lines().count().max(1) as u16,
+            Screen::Transcript => {
+                wrapped_line_count(&self.transcript_text, wrap_width).max(1) as u16
+            }
             Screen::Summary => {
                 if self.summary_wrapped_len > 0 {
                     self.summary_wrapped_len
@@ -264,8 +269,10 @@ impl App {
                     (self.summary_lines.len() + meta).max(1) as u16
                 }
             }
-            Screen::Summarizing => self.summary_text.lines().count().max(1) as u16,
-            Screen::Recording => self.live_lines.len().max(1) as u16,
+            Screen::Summarizing => wrapped_line_count(&self.summary_text, wrap_width).max(1) as u16,
+            Screen::Recording => {
+                wrapped_line_count(&self.live_lines.join("\n"), wrap_width).max(1) as u16
+            }
             _ => 1,
         }
     }
@@ -409,6 +416,30 @@ impl App {
             }
         };
 
+        // Plain text for the model (timestamps stay for UI display only).
+        let transcript = match db::load_transcript_text_plain(&self.pool, &id).await {
+            Ok(t) => t,
+            Err(e) => {
+                let prev = if self.screen == Screen::SummaryPrep {
+                    Screen::SummaryPrep
+                } else {
+                    Screen::Meetings
+                };
+                self.screen = prev;
+                self.status = format!("Could not load transcript: {e}");
+                return Ok(());
+            }
+        };
+        let ctx = self.summary_prefs.context.clone();
+        let extra = if ctx.trim().is_empty() {
+            None
+        } else {
+            Some(ctx)
+        };
+        let backend = self.summary_prefs.backend;
+        let prefs_model = self.summary_prefs.model.clone();
+        let pool = self.pool.clone();
+
         self.summary_meeting_title = title.clone();
         self.summary_ctx_note = ctx_note;
         self.summary_model_label = model_label.clone();
@@ -420,18 +451,6 @@ impl App {
             self.summary_prefs.backend
         );
         self.refresh_summarizing_frame();
-
-        // Plain text for the model (timestamps stay for UI display only).
-        let transcript = db::load_transcript_text_plain(&self.pool, &id).await?;
-        let ctx = self.summary_prefs.context.clone();
-        let extra = if ctx.trim().is_empty() {
-            None
-        } else {
-            Some(ctx)
-        };
-        let backend = self.summary_prefs.backend;
-        let prefs_model = self.summary_prefs.model.clone();
-        let pool = self.pool.clone();
 
         let job = tokio::spawn(async move {
             let model_for_cli = if prefs_model.trim().is_empty() {
@@ -765,12 +784,41 @@ impl App {
             backend_status_line(self.summary_prefs.backend)
         );
     }
+
+    fn cancel_summary_job(&mut self) {
+        if let Some(job) = self.summary_job.take() {
+            job.abort();
+        }
+        self.summary_started = None;
+        self.screen = Screen::Meetings;
+        self.status = "Summary cancelled".into();
+    }
+}
+
+struct TermGuard {
+    active: bool,
+}
+
+impl TermGuard {
+    fn arm() -> Self {
+        let _ = enable_raw_mode();
+        let _ = stdout().execute(EnterAlternateScreen);
+        TermGuard { active: true }
+    }
+}
+
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = disable_raw_mode();
+            let _ = stdout().execute(LeaveAlternateScreen);
+        }
+    }
 }
 
 /// Run the interactive TUI (macOS terminal).
 pub async fn run_tui(paths: MeetilyPaths, pool: SqlitePool) -> anyhow::Result<()> {
-    enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
+    let guard = TermGuard::arm();
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let mut app = App::new(paths, pool).await?;
@@ -795,343 +843,16 @@ pub async fn run_tui(paths: MeetilyPaths, pool: SqlitePool) -> anyhow::Result<()
 
             if event::poll(Duration::from_millis(poll_ms))? {
                 if let Event::Key(key) = event::read()? {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
-                    }
-                    // Ignore input while summarizing (job keeps running).
-                    if app.screen == Screen::Summarizing {
-                        continue;
-                    }
-                    match app.screen {
-                        Screen::Summarizing => {}
-                        Screen::Recording => {
-                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                            let typing = !app.input_buf.is_empty();
-                            match key.code {
-                                KeyCode::Char('r') | KeyCode::Char('R') if !typing => {
-                                    app.start_or_stop_recording().await?;
-                                }
-                                KeyCode::Esc if !typing => {
-                                    app.start_or_stop_recording().await?;
-                                }
-                                // Scroll live transcript when not typing a manual segment
-                                KeyCode::Char('j') | KeyCode::Down if !typing => {
-                                    app.scroll_by(1);
-                                }
-                                KeyCode::Char('k') | KeyCode::Up if !typing => {
-                                    app.scroll_by(-1);
-                                }
-                                KeyCode::Char('d') if ctrl && !typing => {
-                                    app.scroll_by(app.half_page());
-                                }
-                                KeyCode::Char('u') if ctrl && !typing => {
-                                    app.scroll_by(-app.half_page());
-                                }
-                                KeyCode::Char('f') if ctrl && !typing => {
-                                    app.scroll_by(app.page_step());
-                                }
-                                KeyCode::Char('b') if ctrl && !typing => {
-                                    app.scroll_by(-app.page_step());
-                                }
-                                KeyCode::PageDown if !typing => {
-                                    app.scroll_by(app.page_step());
-                                }
-                                KeyCode::PageUp if !typing => {
-                                    app.scroll_by(-app.page_step());
-                                }
-                                KeyCode::Char('g') if !typing => {
-                                    if app.pending_g {
-                                        app.scroll_to(0);
-                                        app.pending_g = false;
-                                    } else {
-                                        app.pending_g = true;
-                                    }
-                                }
-                                KeyCode::Char('G') if !typing => {
-                                    app.pending_g = false;
-                                    app.scroll_to(u16::MAX);
-                                    app.live_follow = true;
-                                }
-                                KeyCode::Enter if !app.input_buf.is_empty() => {
-                                    let line = std::mem::take(&mut app.input_buf);
-                                    app.append_live_line(line).await?;
-                                }
-                                KeyCode::Backspace => {
-                                    app.input_buf.pop();
-                                }
-                                KeyCode::Char(c) if !ctrl => {
-                                    app.pending_g = false;
-                                    app.input_buf.push(c);
-                                }
-                                _ => {}
-                            }
-                        }
-                        Screen::SummaryPrep => {
-                            // Text entry mode: only Esc cancels — never steal h/j/k/etc.
-                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                            match key.code {
-                                KeyCode::Esc => {
-                                    app.screen = Screen::Meetings;
-                                    app.status = "Cancelled summary".into();
-                                }
-                                KeyCode::Tab => {
-                                    app.cycle_summary_backend();
-                                }
-                                KeyCode::Enter => {
-                                    app.start_summary_job().await?;
-                                }
-                                KeyCode::Backspace => {
-                                    app.input_buf.pop();
-                                }
-                                // Ctrl-u: clear line (vim-ish, still useful while typing)
-                                KeyCode::Char('u') if ctrl => {
-                                    app.input_buf.clear();
-                                }
-                                KeyCode::Char(c) if !ctrl => {
-                                    app.input_buf.push(c);
-                                }
-                                _ => {}
-                            }
-                        }
-                        Screen::DeleteConfirm => match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                                app.confirm_delete().await?;
-                            }
-                            KeyCode::Char('n')
-                            | KeyCode::Char('N')
-                            | KeyCode::Esc
-                            | KeyCode::Char('q') => {
-                                app.pending_delete_id = None;
-                                app.screen = Screen::Meetings;
-                                app.status = "Delete cancelled".into();
-                            }
-                            _ => {}
-                        },
-                        Screen::Transcript | Screen::Summary => {
-                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                            match (ctrl, key.code) {
-                                // Ctrl chords first
-                                (true, KeyCode::Char('d')) => app.scroll_by(app.half_page()),
-                                (true, KeyCode::Char('u')) => app.scroll_by(-app.half_page()),
-                                (true, KeyCode::Char('f')) => app.scroll_by(app.page_step()),
-                                (true, KeyCode::Char('b')) => app.scroll_by(-app.page_step()),
-                                // leave
-                                (false, KeyCode::Esc)
-                                | (false, KeyCode::Char('h'))
-                                | (false, KeyCode::Char('b'))
-                                | (false, KeyCode::Char('q')) => {
-                                    app.pending_g = false;
-                                    app.scroll = 0;
-                                    app.screen = Screen::Meetings;
-                                    app.status = "Meetings".into();
-                                }
-                                // scroll
-                                (false, KeyCode::Char('j')) | (_, KeyCode::Down) => {
-                                    app.pending_g = false;
-                                    app.scroll_by(1);
-                                }
-                                (false, KeyCode::Char('k')) | (_, KeyCode::Up) => {
-                                    app.pending_g = false;
-                                    app.scroll_by(-1);
-                                }
-                                (_, KeyCode::PageDown) => {
-                                    app.pending_g = false;
-                                    app.scroll_by(app.page_step());
-                                }
-                                (_, KeyCode::PageUp) => {
-                                    app.pending_g = false;
-                                    app.scroll_by(-app.page_step());
-                                }
-                                (_, KeyCode::Home) => {
-                                    app.pending_g = false;
-                                    app.scroll_to(0);
-                                }
-                                (_, KeyCode::End) => {
-                                    app.pending_g = false;
-                                    app.scroll_to(u16::MAX);
-                                }
-                                (false, KeyCode::Char('g')) => {
-                                    if app.pending_g {
-                                        app.scroll_to(0);
-                                        app.pending_g = false;
-                                    } else {
-                                        app.pending_g = true;
-                                    }
-                                }
-                                (false, KeyCode::Char('G')) => {
-                                    app.pending_g = false;
-                                    app.scroll_to(u16::MAX);
-                                }
-                                (false, KeyCode::Char('s')) => {
-                                    app.pending_g = false;
-                                    app.begin_summary_prep();
-                                }
-                                (false, KeyCode::Char('c')) => {
-                                    app.pending_g = false;
-                                    app.copy_summary_plaintext();
-                                }
-                                (false, KeyCode::Char('t')) if app.screen == Screen::Summary => {
-                                    app.pending_g = false;
-                                    app.open_transcript().await?;
-                                }
-                                (false, KeyCode::Char('d')) | (_, KeyCode::Delete) => {
-                                    app.pending_g = false;
-                                    app.begin_delete_confirm();
-                                }
-                                _ => {
-                                    app.pending_g = false;
-                                }
-                            }
-                        }
-                        Screen::Settings => match key.code {
-                            KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('b') => {
-                                app.pending_g = false;
-                                app.screen = Screen::Meetings;
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                app.pending_g = false;
-                                app.models_move(-1);
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                app.pending_g = false;
-                                app.models_move(1);
-                            }
-                            KeyCode::Char('g') => {
-                                if app.pending_g {
-                                    app.models_state.select(Some(0));
-                                    app.pending_g = false;
-                                } else {
-                                    app.pending_g = true;
-                                }
-                            }
-                            KeyCode::Char('G') => {
-                                app.pending_g = false;
-                                if !app.models_list.is_empty() {
-                                    app.models_state.select(Some(app.models_list.len() - 1));
-                                }
-                            }
-                            KeyCode::Enter | KeyCode::Char('l') => {
-                                app.pending_g = false;
-                                app.select_model_at_cursor().await?;
-                            }
-                            KeyCode::Tab => {
-                                app.pending_g = false;
-                                app.cycle_summary_backend();
-                            }
-                            KeyCode::Char('q') => app.should_quit = true,
-                            _ => {
-                                app.pending_g = false;
-                            }
-                        },
-                        Screen::Meetings => {
-                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                            match key.code {
-                                KeyCode::Char('q') => app.should_quit = true,
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    app.pending_g = false;
-                                    app.list_move(-1);
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    app.pending_g = false;
-                                    app.list_move(1);
-                                }
-                                KeyCode::Char('d') if ctrl => {
-                                    app.pending_g = false;
-                                    app.list_move(10);
-                                }
-                                KeyCode::Char('u') if ctrl => {
-                                    app.pending_g = false;
-                                    app.list_move(-10);
-                                }
-                                KeyCode::Char('g') => {
-                                    if app.pending_g {
-                                        app.list_goto_top();
-                                        app.pending_g = false;
-                                    } else {
-                                        app.pending_g = true;
-                                    }
-                                }
-                                KeyCode::Char('G') => {
-                                    app.pending_g = false;
-                                    app.list_goto_bottom();
-                                }
-                                KeyCode::Enter | KeyCode::Char('l') => {
-                                    app.pending_g = false;
-                                    app.open_meeting().await?;
-                                }
-                                KeyCode::Char('t') => {
-                                    app.pending_g = false;
-                                    app.open_transcript().await?;
-                                }
-                                KeyCode::Char('h') => {
-                                    // stay on list
-                                    app.pending_g = false;
-                                }
-                                KeyCode::Char('r') => {
-                                    app.pending_g = false;
-                                    app.start_or_stop_recording().await?;
-                                }
-                                KeyCode::Char('s') => {
-                                    app.pending_g = false;
-                                    app.open_or_prep_summary().await?;
-                                }
-                                KeyCode::Char('v') => {
-                                    app.pending_g = false;
-                                    app.view_cached_summary().await?;
-                                }
-                                KeyCode::Char('d') | KeyCode::Delete if !ctrl => {
-                                    app.pending_g = false;
-                                    app.begin_delete_confirm();
-                                }
-                                KeyCode::Char('m') => {
-                                    app.pending_g = false;
-                                    app.refresh_models();
-                                    app.screen = Screen::Settings;
-                                    app.status = format!(
-                                        "Models — {}/{}  j/k · Enter select · Tab backend · h back",
-                                        app.model_selection.provider, app.model_selection.model
-                                    );
-                                }
-                                KeyCode::Char('R') => {
-                                    // capital R = refresh list (vim-ish reload)
-                                    app.pending_g = false;
-                                    app.refresh_meetings().await?;
-                                    app.status =
-                                        format!("Refreshed ({} meetings)", app.meetings.len());
-                                }
-                                KeyCode::Tab => {
-                                    app.pending_g = false;
-                                    app.cycle_summary_backend();
-                                }
-                                _ => {
-                                    app.pending_g = false;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let Some(h) = app.recording.as_ref() {
-                let segs = h.live_segments();
-                if segs.len() != app.live_lines.len() {
-                    app.live_lines = segs
-                        .into_iter()
-                        .map(|s| {
-                            format!("[{}] {}", db::format_media_timestamp(s.audio_start), s.text)
-                        })
-                        .collect();
-                    if app.live_follow {
-                        // Stick to bottom as new speech arrives.
-                        let max = app
-                            .scroll_content_len()
-                            .saturating_sub(app.content_height.max(1));
-                        app.scroll = max;
+                    if let Err(e) = handle_key(&mut app, key).await {
+                        app.status = format!("error: {e}");
                     }
                 }
             }
 
             if app.should_quit {
+                if let Some(job) = app.summary_job.take() {
+                    job.abort();
+                }
                 if app.recording.is_some() {
                     app.start_or_stop_recording().await?;
                 }
@@ -1142,9 +863,345 @@ pub async fn run_tui(paths: MeetilyPaths, pool: SqlitePool) -> anyhow::Result<()
     }
     .await;
 
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
+    drop(guard);
     result
+}
+
+async fn handle_key(app: &mut App, key: event::KeyEvent) -> anyhow::Result<()> {
+    if key.kind != KeyEventKind::Press {
+        return Ok(());
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        match app.screen {
+            Screen::Summarizing => app.cancel_summary_job(),
+            Screen::Recording => {
+                app.start_or_stop_recording().await?;
+                app.should_quit = true;
+            }
+            _ => app.should_quit = true,
+        }
+        return Ok(());
+    }
+
+    match app.screen {
+        Screen::Summarizing => match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                app.cancel_summary_job();
+            }
+            _ => {}
+        },
+        Screen::Recording => {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let typing = !app.input_buf.is_empty();
+            match key.code {
+                KeyCode::Char('r') | KeyCode::Char('R') if !typing => {
+                    app.start_or_stop_recording().await?;
+                }
+                KeyCode::Esc if !typing => {
+                    app.start_or_stop_recording().await?;
+                }
+                // Scroll live transcript when not typing a manual segment
+                KeyCode::Char('j') | KeyCode::Down if !typing => {
+                    app.scroll_by(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up if !typing => {
+                    app.scroll_by(-1);
+                }
+                KeyCode::Char('d') if ctrl && !typing => {
+                    app.scroll_by(app.half_page());
+                }
+                KeyCode::Char('u') if ctrl && !typing => {
+                    app.scroll_by(-app.half_page());
+                }
+                KeyCode::Char('u') if ctrl => {
+                    app.input_buf.clear();
+                }
+                KeyCode::Char('f') if ctrl && !typing => {
+                    app.scroll_by(app.page_step());
+                }
+                KeyCode::Char('b') if ctrl && !typing => {
+                    app.scroll_by(-app.page_step());
+                }
+                KeyCode::PageDown if !typing => {
+                    app.scroll_by(app.page_step());
+                }
+                KeyCode::PageUp if !typing => {
+                    app.scroll_by(-app.page_step());
+                }
+                KeyCode::Char('g') if !typing => {
+                    if app.pending_g {
+                        app.scroll_to(0);
+                        app.pending_g = false;
+                    } else {
+                        app.pending_g = true;
+                    }
+                }
+                KeyCode::Char('G') if !typing => {
+                    app.pending_g = false;
+                    app.scroll_to(u16::MAX);
+                    app.live_follow = true;
+                }
+                KeyCode::Enter if !app.input_buf.is_empty() => {
+                    let line = std::mem::take(&mut app.input_buf);
+                    app.append_live_line(line).await?;
+                }
+                KeyCode::Backspace => {
+                    app.input_buf.pop();
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    app.pending_g = false;
+                    app.input_buf.push(c);
+                }
+                _ => {}
+            }
+        }
+        Screen::SummaryPrep => {
+            // Text entry mode: only Esc cancels — never steal h/j/k/etc.
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Esc => {
+                    app.screen = Screen::Meetings;
+                    app.status = "Cancelled summary".into();
+                }
+                KeyCode::Tab => {
+                    app.cycle_summary_backend();
+                }
+                KeyCode::Enter => {
+                    app.start_summary_job().await?;
+                }
+                KeyCode::Backspace => {
+                    app.input_buf.pop();
+                }
+                // Ctrl-u: clear line (vim-ish, still useful while typing)
+                KeyCode::Char('u') if ctrl => {
+                    app.input_buf.clear();
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    app.input_buf.push(c);
+                }
+                _ => {}
+            }
+        }
+        Screen::DeleteConfirm => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                app.confirm_delete().await?;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                app.pending_delete_id = None;
+                app.screen = Screen::Meetings;
+                app.status = "Delete cancelled".into();
+            }
+            _ => {}
+        },
+        Screen::Transcript | Screen::Summary => {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match (ctrl, key.code) {
+                // Ctrl chords first
+                (true, KeyCode::Char('d')) => app.scroll_by(app.half_page()),
+                (true, KeyCode::Char('u')) => app.scroll_by(-app.half_page()),
+                (true, KeyCode::Char('f')) => app.scroll_by(app.page_step()),
+                (true, KeyCode::Char('b')) => app.scroll_by(-app.page_step()),
+                // leave
+                (false, KeyCode::Esc)
+                | (false, KeyCode::Char('h'))
+                | (false, KeyCode::Char('b'))
+                | (false, KeyCode::Char('q')) => {
+                    app.pending_g = false;
+                    app.scroll = 0;
+                    app.screen = Screen::Meetings;
+                    app.status = "Meetings".into();
+                }
+                // scroll
+                (false, KeyCode::Char('j')) | (_, KeyCode::Down) => {
+                    app.pending_g = false;
+                    app.scroll_by(1);
+                }
+                (false, KeyCode::Char('k')) | (_, KeyCode::Up) => {
+                    app.pending_g = false;
+                    app.scroll_by(-1);
+                }
+                (_, KeyCode::PageDown) => {
+                    app.pending_g = false;
+                    app.scroll_by(app.page_step());
+                }
+                (_, KeyCode::PageUp) => {
+                    app.pending_g = false;
+                    app.scroll_by(-app.page_step());
+                }
+                (_, KeyCode::Home) => {
+                    app.pending_g = false;
+                    app.scroll_to(0);
+                }
+                (_, KeyCode::End) => {
+                    app.pending_g = false;
+                    app.scroll_to(u16::MAX);
+                }
+                (false, KeyCode::Char('g')) => {
+                    if app.pending_g {
+                        app.scroll_to(0);
+                        app.pending_g = false;
+                    } else {
+                        app.pending_g = true;
+                    }
+                }
+                (false, KeyCode::Char('G')) => {
+                    app.pending_g = false;
+                    app.scroll_to(u16::MAX);
+                }
+                (false, KeyCode::Char('s')) => {
+                    app.pending_g = false;
+                    app.begin_summary_prep();
+                }
+                (false, KeyCode::Char('c')) => {
+                    app.pending_g = false;
+                    app.copy_summary_plaintext();
+                }
+                (false, KeyCode::Char('t')) if app.screen == Screen::Summary => {
+                    app.pending_g = false;
+                    app.open_transcript().await?;
+                }
+                (false, KeyCode::Char('d')) | (_, KeyCode::Delete) => {
+                    app.pending_g = false;
+                    app.begin_delete_confirm();
+                }
+                _ => {
+                    app.pending_g = false;
+                }
+            }
+        }
+        Screen::Settings => match key.code {
+            KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('b') => {
+                app.pending_g = false;
+                app.screen = Screen::Meetings;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.pending_g = false;
+                app.models_move(-1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.pending_g = false;
+                app.models_move(1);
+            }
+            KeyCode::Char('g') => {
+                if app.pending_g {
+                    app.models_state.select(Some(0));
+                    app.pending_g = false;
+                } else {
+                    app.pending_g = true;
+                }
+            }
+            KeyCode::Char('G') => {
+                app.pending_g = false;
+                if !app.models_list.is_empty() {
+                    app.models_state.select(Some(app.models_list.len() - 1));
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('l') => {
+                app.pending_g = false;
+                app.select_model_at_cursor().await?;
+            }
+            KeyCode::Tab => {
+                app.pending_g = false;
+                app.cycle_summary_backend();
+            }
+            KeyCode::Char('q') => app.should_quit = true,
+            _ => {
+                app.pending_g = false;
+            }
+        },
+        Screen::Meetings => {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Char('q') => app.should_quit = true,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.pending_g = false;
+                    app.list_move(-1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.pending_g = false;
+                    app.list_move(1);
+                }
+                KeyCode::Char('d') if ctrl => {
+                    app.pending_g = false;
+                    app.list_move(10);
+                }
+                KeyCode::Char('u') if ctrl => {
+                    app.pending_g = false;
+                    app.list_move(-10);
+                }
+                KeyCode::Char('g') => {
+                    if app.pending_g {
+                        app.list_goto_top();
+                        app.pending_g = false;
+                    } else {
+                        app.pending_g = true;
+                    }
+                }
+                KeyCode::Char('G') => {
+                    app.pending_g = false;
+                    app.list_goto_bottom();
+                }
+                KeyCode::Enter | KeyCode::Char('l') => {
+                    app.pending_g = false;
+                    app.open_meeting().await?;
+                }
+                KeyCode::Char('t') => {
+                    app.pending_g = false;
+                    app.open_transcript().await?;
+                }
+                KeyCode::Char('h') => {
+                    // stay on list
+                    app.pending_g = false;
+                }
+                KeyCode::Char('r') => {
+                    app.pending_g = false;
+                    app.start_or_stop_recording().await?;
+                }
+                KeyCode::Char('s') => {
+                    app.pending_g = false;
+                    app.open_or_prep_summary().await?;
+                }
+                KeyCode::Char('v') => {
+                    app.pending_g = false;
+                    app.view_cached_summary().await?;
+                }
+                KeyCode::Char('c') => {
+                    app.pending_g = false;
+                    app.view_cached_summary().await?;
+                }
+                KeyCode::Char('d') | KeyCode::Delete if !ctrl => {
+                    app.pending_g = false;
+                    app.begin_delete_confirm();
+                }
+                KeyCode::Char('m') => {
+                    app.pending_g = false;
+                    app.refresh_models();
+                    app.screen = Screen::Settings;
+                    app.status = format!(
+                        "Models — {}/{}  j/k · Enter select · Tab backend · h back",
+                        app.model_selection.provider, app.model_selection.model
+                    );
+                }
+                KeyCode::Char('R') => {
+                    // capital R = refresh list (vim-ish reload)
+                    app.pending_g = false;
+                    app.refresh_meetings().await?;
+                    app.status = format!("Refreshed ({} meetings)", app.meetings.len());
+                }
+                KeyCode::Tab => {
+                    app.pending_g = false;
+                    app.cycle_summary_backend();
+                }
+                _ => {
+                    app.pending_g = false;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn draw_ui(f: &mut ratatui::Frame, app: &mut App) {
@@ -1175,6 +1232,7 @@ fn draw_ui(f: &mut ratatui::Frame, app: &mut App) {
 
     // Content height inside border for page scrolling.
     app.content_height = chunks[1].height.saturating_sub(2);
+    app.content_width = chunks[1].width.saturating_sub(2);
 
     match app.screen {
         Screen::Meetings => draw_meetings(f, app, chunks[1]),
@@ -1242,7 +1300,8 @@ fn draw_scroll_text(
     scroll: u16,
     hints: &str,
 ) {
-    let line_count = text.lines().count().max(1) as u16;
+    let wrap_width = area.width.saturating_sub(2).max(1) as usize;
+    let line_count = wrapped_line_count(text, wrap_width).max(1) as u16;
     let view_h = area.height.saturating_sub(2).max(1);
     let max_scroll = line_count.saturating_sub(view_h);
     let scroll = scroll.min(max_scroll);
@@ -1394,6 +1453,12 @@ fn soft_wrap_line(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
     out
 }
 
+fn wrapped_line_count(text: &str, width: usize) -> usize {
+    text.lines()
+        .map(|l| soft_wrap_line(&Line::from(l), width).len())
+        .sum()
+}
+
 fn chars_to_line(chars: Vec<(char, Style)>) -> Line<'static> {
     if chars.is_empty() {
         return Line::from("");
@@ -1451,6 +1516,7 @@ fn draw_recording(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     // Live transcript pane height drives scroll math.
     app.content_height = chunks[1].height.saturating_sub(2);
+    app.content_width = chunks[1].width.saturating_sub(2);
 
     let verbose = app
         .recording
@@ -1478,8 +1544,9 @@ fn draw_recording(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     } else {
         app.live_lines.join("\n")
     };
-    // Approximate scroll range from logical lines; wrap handles long lines visually.
-    let line_count = body.lines().count().max(1) as u16;
+    // Wrapped line count so long lines stay reachable when scrolling.
+    let wrap_width = chunks[1].width.saturating_sub(2).max(1) as usize;
+    let line_count = wrapped_line_count(&body, wrap_width).max(1) as u16;
     let view_h = chunks[1].height.saturating_sub(2).max(1);
     let max_scroll = line_count.saturating_sub(view_h);
     let scroll = if app.live_follow {

@@ -88,23 +88,52 @@ private func ioProc(
     _ inOutputTime: UnsafePointer<AudioTimeStamp>,
     _ inClientData: UnsafeMutableRawPointer?
 ) -> OSStatus {
-    let abl = inInputData.pointee
-    let buf = abl.mBuffers
-    let byteCount = Int(buf.mDataByteSize)
-    guard byteCount > 0, let data = buf.mData else { return noErr }
-    let floatCount = byteCount / MemoryLayout<Float>.size
-    let floats = data.assumingMemoryBound(to: Float.self)
-    // Write raw f32le mono (tap is mono global)
-    let ptr = UnsafeRawPointer(floats).assumingMemoryBound(to: UInt8.self)
-    let slice = UnsafeBufferPointer(start: ptr, count: floatCount * MemoryLayout<Float>.size)
-    let written = fwrite(slice.baseAddress, 1, slice.count, stdout)
-    if written != slice.count {
+    // The tap may deliver interleaved or multi-channel data depending on the
+    // aggregate format. Downmix everything to mono Float32; bail loudly if a
+    // buffer cannot be interpreted as Float32.
+    let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
+    var samples: [Float] = []
+    samples.reserveCapacity(4096)
+    for buf in buffers {
+        let byteCount = Int(buf.mDataByteSize)
+        guard byteCount > 0, let data = buf.mData else { continue }
+        guard byteCount % MemoryLayout<Float>.size == 0 else {
+            fputs("ERROR ioProc: tap delivered a non-Float32 buffer (\(byteCount) bytes)\n", stderr)
+            fflush(stderr)
+            exit(1)
+        }
+        let ch = max(1, min(Int(buf.mNumberChannels), 64))
+        let floatCount = byteCount / MemoryLayout<Float>.size
+        let floats = data.assumingMemoryBound(to: Float.self)
+        if ch == 1 {
+            samples.append(contentsOf: UnsafeBufferPointer(start: floats, count: floatCount))
+        } else {
+            // Interleaved multi-channel → average channels into mono.
+            let frames = floatCount / ch
+            var mono = [Float](repeating: 0, count: frames)
+            for f in 0..<frames {
+                var sum: Float = 0
+                for c in 0..<ch {
+                    sum += floats[f * ch + c]
+                }
+                mono[f] = sum / Float(ch)
+            }
+            samples.append(contentsOf: mono)
+        }
+    }
+    guard !samples.isEmpty else { return noErr }
+    let written = samples.withUnsafeBytes { raw -> Int in
+        fwrite(raw.baseAddress!, 1, raw.count, stdout)
+    }
+    if written != samples.count * MemoryLayout<Float>.size {
         gState.running = false
     }
     return noErr
 }
 
 func main() {
+    // Unbuffered stdout: PCM + READY must stream immediately.
+    setvbuf(stdout, nil, _IONBF, 0)
     // Default output (what the user hears — Zoom/Meet/etc.)
     let outID = defaultOutputDeviceID()
     let outUID = deviceUID(outID)
@@ -174,7 +203,23 @@ func main() {
         die("AudioDeviceStart failed: \(err) — check Audio Capture permission")
     }
 
-    fputs("READY sample_rate=\(Int(rate)) device=\(outName)\n", stderr)
+    // Report the ACTUAL stream format the tap delivers (may differ from the
+    // nominal device rate). Fall back to the nominal rate on query failure.
+    var fmtAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyStreamFormat,
+        mScope: kAudioDevicePropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var fmtSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+    var streamFormat = AudioStreamBasicDescription()
+    var actualRate = rate
+    if AudioObjectGetPropertyData(aggID, &fmtAddr, 0, nil, &fmtSize, &streamFormat) == noErr,
+       streamFormat.mSampleRate > 0 {
+        actualRate = streamFormat.mSampleRate
+    }
+    gState.sampleRate = actualRate
+
+    fputs("READY sample_rate=\(Int(actualRate)) device=\(outName)\n", stderr)
     fflush(stderr)
 
     // Run until parent closes stdin or SIGTERM

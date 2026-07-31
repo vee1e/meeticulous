@@ -1,5 +1,5 @@
 use super::models::TranscriptSegment;
-use super::touch_meeting;
+use super::touch_meeting_in_tx;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -96,6 +96,7 @@ pub async fn append_transcript_segment(
     speaker: Option<&str>,
 ) -> Result<String, sqlx::Error> {
     let id = format!("transcript-{}", Uuid::new_v4());
+    let mut tx = pool.begin().await?;
     sqlx::query(
         r#"
         INSERT INTO transcripts
@@ -111,10 +112,69 @@ pub async fn append_transcript_segment(
     .bind(audio_end_time)
     .bind(duration)
     .bind(speaker)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    touch_meeting(pool, meeting_id).await?;
+    touch_meeting_in_tx(&mut tx, meeting_id).await?;
+    tx.commit().await?;
     Ok(id)
+}
+
+/// Import an entire meeting's transcript segments in ONE transaction: a row per
+/// line plus the `transcript_chunks` upsert. Caller owns meeting lifecycle.
+pub async fn import_meeting_with_segments(
+    pool: &SqlitePool,
+    meeting_id: &str,
+    meeting_name: &str,
+    lines: &[&str],
+    model: &str,
+    model_name: &str,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    for (i, line) in lines.iter().enumerate() {
+        let id = format!("transcript-{}", Uuid::new_v4());
+        let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+        let start = i as f64 * 2.0;
+        sqlx::query(
+            r#"
+            INSERT INTO transcripts
+                (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+            "#,
+        )
+        .bind(&id)
+        .bind(meeting_id)
+        .bind(*line)
+        .bind(&timestamp)
+        .bind(start)
+        .bind(start + 2.0)
+        .bind(2.0)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let transcript_text = lines.join("\n");
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO transcript_chunks
+            (meeting_id, meeting_name, transcript_text, model, model_name, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(meeting_id) DO UPDATE SET
+            meeting_name = excluded.meeting_name,
+            transcript_text = excluded.transcript_text,
+            model = excluded.model,
+            model_name = excluded.model_name,
+            created_at = excluded.created_at
+        "#,
+    )
+    .bind(meeting_id)
+    .bind(meeting_name)
+    .bind(&transcript_text)
+    .bind(model)
+    .bind(model_name)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
 }
 
 /// Upsert transcript_chunks blob used by summary pipeline (Meetily shape).
