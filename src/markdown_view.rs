@@ -174,6 +174,34 @@ pub fn markdown_to_lines(md: &str) -> Vec<Line<'static>> {
                 )));
                 lines.push(Line::from(""));
             }
+            Event::TaskListMarker(checked) => {
+                pending_prefix = Some(if checked {
+                    "[x] ".into()
+                } else {
+                    "[ ] ".into()
+                });
+            }
+            Event::Html(t) | Event::InlineHtml(t) => {
+                let style = current_style(&style_stack);
+                for (i, line) in t.split('\n').enumerate() {
+                    if i > 0 {
+                        push_line(&mut lines, &mut current);
+                    }
+                    let mut s = line.to_string();
+                    if i == 0 {
+                        if let Some(prefix) = pending_prefix.take() {
+                            s = format!("{prefix}{s}");
+                        }
+                    }
+                    current.push(Span::styled(s, style));
+                }
+            }
+            Event::FootnoteReference(name) => {
+                current.push(Span::styled(
+                    format!("[^{name}]"),
+                    current_style(&style_stack),
+                ));
+            }
             _ => {}
         }
     }

@@ -165,32 +165,32 @@ pub fn discover_parakeet_models(parakeet_dir: &Path) -> Vec<DiscoveredModel> {
 }
 
 fn is_parakeet_model_dir(dir: &Path) -> bool {
-    let has_onnx = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.flatten().any(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    .map(|x| x.eq_ignore_ascii_case("onnx"))
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
-    let has_vocab = dir.join("vocab.txt").is_file();
-    has_onnx && has_vocab
+    let has_onnx = |stem: &str| {
+        dir.join(format!("{stem}.onnx")).is_file()
+            || dir.join(format!("{stem}.int8.onnx")).is_file()
+    };
+    dir.join("vocab.txt").is_file()
+        && has_onnx("encoder-model")
+        && has_onnx("decoder_joint-model")
+        && dir.join("nemo128.onnx").is_file()
 }
 
 fn dir_size_mb(dir: &Path) -> u64 {
-    let mut total = 0u64;
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            if let Ok(meta) = e.metadata() {
-                if meta.is_file() {
-                    total += meta.len();
+    fn walk(dir: &Path, total: &mut u64) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                if let Ok(meta) = e.metadata() {
+                    if meta.is_dir() {
+                        walk(&e.path(), total);
+                    } else if meta.is_file() {
+                        *total += meta.len();
+                    }
                 }
             }
         }
     }
+    let mut total = 0u64;
+    walk(dir, &mut total);
     total / (1024 * 1024)
 }
 
@@ -270,6 +270,8 @@ mod tests {
         // fake parakeet onnx + vocab
         let pk = models.join("parakeet").join("parakeet-tdt-0.6b-v3-int8");
         std::fs::write(pk.join("encoder-model.int8.onnx"), b"onnx").unwrap();
+        std::fs::write(pk.join("decoder_joint-model.int8.onnx"), b"onnx").unwrap();
+        std::fs::write(pk.join("nemo128.onnx"), b"onnx").unwrap();
         std::fs::write(pk.join("vocab.txt"), b"a\nb\n").unwrap();
 
         let found = discover_models(&models);
@@ -284,6 +286,16 @@ mod tests {
             .expect("parakeet");
         assert!(pk_m.available);
         assert_eq!(pk_m.provider, TranscriptionProvider::Parakeet);
+    }
+
+    #[test]
+    fn parakeet_dir_requires_all_onnx_parts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pk = tmp.path().join("partial");
+        std::fs::create_dir_all(&pk).unwrap();
+        std::fs::write(pk.join("encoder-model.int8.onnx"), b"onnx").unwrap();
+        std::fs::write(pk.join("vocab.txt"), b"a\nb\n").unwrap();
+        assert!(!is_parakeet_model_dir(&pk));
     }
 
     #[test]

@@ -20,8 +20,8 @@ pub async fn get_summary(
     .await
 }
 
-pub async fn create_or_reset_process(
-    pool: &SqlitePool,
+async fn run_create_or_reset(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Sqlite>,
     meeting_id: &str,
 ) -> Result<(), sqlx::Error> {
     let now = Utc::now().to_rfc3339();
@@ -29,11 +29,12 @@ pub async fn create_or_reset_process(
         r#"
         INSERT INTO summary_processes
             (meeting_id, status, created_at, updated_at, start_time, result, error)
-        VALUES (?, 'PENDING', ?, ?, ?, NULL, NULL)
+        VALUES (?, 'pending', ?, ?, ?, NULL, NULL)
         ON CONFLICT(meeting_id) DO UPDATE SET
-            status = 'PENDING',
+            status = 'pending',
             updated_at = excluded.updated_at,
             start_time = excluded.start_time,
+            result = NULL,
             result_backup = result,
             result_backup_timestamp = excluded.updated_at,
             error = NULL
@@ -43,13 +44,20 @@ pub async fn create_or_reset_process(
     .bind(&now)
     .bind(&now)
     .bind(&now)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
 
-pub async fn mark_completed(
+pub async fn create_or_reset_process(
     pool: &SqlitePool,
+    meeting_id: &str,
+) -> Result<(), sqlx::Error> {
+    run_create_or_reset(pool, meeting_id).await
+}
+
+async fn run_mark_completed(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Sqlite>,
     meeting_id: &str,
     result: &Value,
     chunk_count: i64,
@@ -73,9 +81,19 @@ pub async fn mark_completed(
     .bind(chunk_count)
     .bind(processing_time)
     .bind(meeting_id)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
+}
+
+pub async fn mark_completed(
+    pool: &SqlitePool,
+    meeting_id: &str,
+    result: &Value,
+    chunk_count: i64,
+    processing_time: f64,
+) -> Result<(), sqlx::Error> {
+    run_mark_completed(pool, meeting_id, result, chunk_count, processing_time).await
 }
 
 pub async fn mark_failed(
@@ -108,16 +126,29 @@ pub async fn store_summary_for_meeting(
     meeting_id: &str,
     summary: &Value,
 ) -> Result<(), sqlx::Error> {
-    create_or_reset_process(pool, meeting_id).await?;
-    mark_completed(pool, meeting_id, summary, 1, 0.0).await?;
+    store_summary_for_meeting_with_stats(pool, meeting_id, summary, 1, 0.0).await
+}
+
+/// Atomic store: reset process row, write completed summary, and touch the
+/// meeting inside a single transaction so a stale result is never observable.
+pub async fn store_summary_for_meeting_with_stats(
+    pool: &SqlitePool,
+    meeting_id: &str,
+    summary: &Value,
+    chunk_count: i64,
+    processing_time: f64,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    run_create_or_reset(&mut *tx, meeting_id).await?;
+    run_mark_completed(&mut *tx, meeting_id, summary, chunk_count, processing_time).await?;
     // Touch meeting so list ordering / GUI picks up the write.
     let now = Utc::now().to_rfc3339();
     sqlx::query("UPDATE meetings SET updated_at = ? WHERE id = ?")
         .bind(now)
         .bind(meeting_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    tx.commit().await
 }
 
 /// Load stored summary plain text for a meeting (Meeticulous plain + legacy JSON).

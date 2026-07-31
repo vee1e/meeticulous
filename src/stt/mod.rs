@@ -168,6 +168,20 @@ pub struct SttSegment {
 pub type DiagHandle = Arc<Mutex<RecordingDiagnostics>>;
 pub type SegmentQueue = Arc<Mutex<Vec<SttSegment>>>;
 
+const MAX_FEED_CAPACITY: usize = 4_000_000;
+
+fn with_diag(d: &DiagHandle, f: impl FnOnce(&mut RecordingDiagnostics)) {
+    if let Ok(mut g) = d.lock() {
+        f(&mut g);
+    }
+}
+
+fn take_samples(s: &Arc<Mutex<Vec<f32>>>) -> Vec<f32> {
+    s.lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or_default()
+}
+
 /// Resolve model directory for the current selection.
 pub fn resolve_stt_model_dir(paths: &MeetilyPaths, selection: &ModelSelection) -> Option<PathBuf> {
     let p = resolve_model_path(&paths.models_dir, selection.provider, &selection.model)?;
@@ -219,13 +233,65 @@ pub fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> 
     let ratio = to_rate as f64 / from_rate as f64;
     let out_len = ((input.len() as f64) * ratio).round().max(1.0) as usize;
     let mut out = Vec::with_capacity(out_len);
+    let filtered = if to_rate < from_rate {
+        lowpass_fir(input, from_rate, to_rate)
+    } else {
+        input.to_vec()
+    };
     for i in 0..out_len {
         let src = i as f64 / ratio;
         let i0 = src.floor() as usize;
-        let i1 = (i0 + 1).min(input.len() - 1);
+        let i1 = (i0 + 1).min(filtered.len() - 1);
         let t = (src - i0 as f64) as f32;
-        let s = input[i0] * (1.0 - t) + input[i1] * t;
+        let s = filtered[i0] * (1.0 - t) + filtered[i1] * t;
         out.push(s);
+    }
+    out
+}
+
+fn lowpass_fir(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    const TAPS: usize = 64;
+    let cutoff = (0.45 * to_rate as f64) / from_rate as f64;
+    if cutoff <= 0.0 || cutoff >= 0.5 {
+        return input.to_vec();
+    }
+    let pi = std::f64::consts::PI;
+    let mid = (TAPS - 1) as f64 / 2.0;
+    let mut taps = [0.0f64; TAPS];
+    let mut sum = 0.0f64;
+    for (i, tap) in taps.iter_mut().enumerate() {
+        let x = i as f64 - mid;
+        let sinc = if x == 0.0 {
+            2.0 * cutoff
+        } else {
+            (2.0 * pi * cutoff * x).sin() / (pi * x)
+        };
+        let w = 0.54 - 0.46 * (2.0 * pi * i as f64 / (TAPS - 1) as f64).cos();
+        *tap = sinc * w;
+        sum += *tap;
+    }
+    for tap in taps.iter_mut() {
+        *tap /= sum;
+    }
+    let pad = TAPS / 2;
+    let first = input[0];
+    let last = input[input.len() - 1];
+    let in_len = input.len() as isize;
+    let mut out = Vec::with_capacity(input.len());
+    for n in 0..input.len() {
+        let mut acc = 0.0f64;
+        for (k, &tap) in taps.iter().enumerate() {
+            let idx = n as isize + k as isize - pad as isize;
+            let v = if idx < 0 {
+                first
+            } else if idx >= in_len {
+                last
+            } else {
+                input[idx as usize]
+            };
+            acc += tap * v as f64;
+        }
+        out.push((acc as f32).clamp(-1.0, 1.0));
     }
     out
 }
@@ -266,7 +332,7 @@ pub fn spawn_stt_worker(
     out_segments: SegmentQueue,
     paths: MeetilyPaths,
     selection: ModelSelection,
-    session_start: Instant,
+    _session_start: Instant,
 ) -> Option<std::thread::JoinHandle<()>> {
     // Tests / CI: skip heavy ONNX + mic-level loops unless explicitly enabled.
     if std::env::var_os("MEETICULOUS_DISABLE_STT").is_some() {
@@ -288,7 +354,6 @@ pub fn spawn_stt_worker(
                 out_segments,
                 paths,
                 selection,
-                session_start,
             );
         })
         .ok()
@@ -304,17 +369,15 @@ fn stt_worker_loop(
     out_segments: SegmentQueue,
     paths: MeetilyPaths,
     selection: ModelSelection,
-    session_start: Instant,
 ) {
-    {
-        let mut d = diag.lock().unwrap();
+    with_diag(&diag, |d| {
         d.stt_engine = format!("{} / {}", selection.provider, selection.model);
         d.stt_status = "loading model…".into();
         d.push_log(format!(
             "STT worker start provider={} model={}",
             selection.provider, selection.model
         ));
-    }
+    });
 
     let model_dir = match selection.provider {
         TranscriptionProvider::Parakeet => resolve_stt_model_dir(&paths, &selection),
@@ -326,9 +389,10 @@ fn stt_worker_loop(
             parakeet_sel.model = crate::models::DEFAULT_PARAKEET_MODEL.to_string();
             let pk = resolve_stt_model_dir(&paths, &parakeet_sel);
             if whisper.is_none() && pk.is_some() {
-                let mut d = diag.lock().unwrap();
-                d.push_log("Whisper ggml not found; falling back to Parakeet for live STT");
-                d.stt_engine = format!("parakeet / {}", parakeet_sel.model);
+                with_diag(&diag, |d| {
+                    d.push_log("Whisper ggml not found; falling back to Parakeet for live STT");
+                    d.stt_engine = format!("parakeet / {}", parakeet_sel.model);
+                });
                 pk
             } else {
                 whisper
@@ -337,24 +401,24 @@ fn stt_worker_loop(
     };
 
     let Some(model_path) = model_dir else {
-        let mut d = diag.lock().unwrap();
-        d.stt_status = "NO MODEL — install Parakeet under models/parakeet/".into();
-        d.push_log(format!(
-            "ERROR: no model for {} / {} under {}",
-            selection.provider,
-            selection.model,
-            paths.models_dir.display()
-        ));
+        with_diag(&diag, |d| {
+            d.stt_status = "NO MODEL — install Parakeet under models/parakeet/".into();
+            d.push_log(format!(
+                "ERROR: no model for {} / {} under {}",
+                selection.provider,
+                selection.model,
+                paths.models_dir.display()
+            ));
+        });
         // Keep updating levels even without STT
         levels_only_loop(&samples, sample_rate, channels, &stop, &diag);
         return;
     };
 
-    {
-        let mut d = diag.lock().unwrap();
+    with_diag(&diag, |d| {
         d.stt_model_path = model_path.display().to_string();
         d.push_log(format!("loading ONNX from {}", model_path.display()));
-    }
+    });
 
     let quantized = model_path
         .file_name()
@@ -365,42 +429,36 @@ fn stt_worker_loop(
     let mut model = match ParakeetModel::new(&model_path, quantized) {
         Ok(m) => m,
         Err(e) => {
-            // try opposite quantization flag
-            match ParakeetModel::new(&model_path, !quantized) {
-                Ok(m) => m,
-                Err(e2) => {
-                    let mut d = diag.lock().unwrap();
-                    d.stt_status = format!("model load failed: {e2}");
-                    d.push_log(format!("ERROR load model: {e} / retry: {e2}"));
-                    levels_only_loop(&samples, sample_rate, channels, &stop, &diag);
-                    return;
-                }
-            }
+            with_diag(&diag, |d| {
+                d.stt_status = format!("model load failed: {e}");
+                d.push_log(format!("ERROR load model: {e}"));
+            });
+            levels_only_loop(&samples, sample_rate, channels, &stop, &diag);
+            return;
         }
     };
 
-    {
-        let mut d = diag.lock().unwrap();
+    with_diag(&diag, |d| {
         d.stt_status = "ready · waiting for speech".into();
         d.push_log("Parakeet model loaded OK");
-    }
+    });
 
     let mut cursor: usize = 0; // index into mono sample history (device rate, mono)
     let mut mono_history: Vec<f32> = Vec::new();
     let mut absolute_mono_offset: u64 = 0; // total mono samples ever (for timestamps)
 
     let chunk_secs = 3.0f32;
-    let hop_secs = 2.5f32;
+    let hop_secs = chunk_secs;
     let min_rms = 0.008f32;
     let ch = channels.max(1) as usize;
 
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
         // Drain the incremental feed atomically. A bounded buffer whose length stays
         // constant must not be mistaken for a feed with no new audio.
-        let new_interleaved = {
-            let mut pending = samples.lock().unwrap();
-            std::mem::take(&mut *pending)
-        };
+        let mut new_interleaved = take_samples(&samples);
+        if new_interleaved.capacity() > MAX_FEED_CAPACITY {
+            new_interleaved.shrink_to(MAX_FEED_CAPACITY);
+        }
         if !new_interleaved.is_empty() {
             let usable = new_interleaved.len() - (new_interleaved.len() % ch);
             if usable > 0 {
@@ -417,8 +475,7 @@ fn stt_worker_loop(
             mono_history.as_slice()
         };
         let (rms, peak) = compute_rms_peak(recent);
-        {
-            let mut d = diag.lock().unwrap();
+        with_diag(&diag, |d| {
             d.buffer_samples = mono_history.len();
             d.buffer_secs = mono_history.len() as f32 / sample_rate.max(1) as f32;
             d.rms = rms;
@@ -426,7 +483,7 @@ fn stt_worker_loop(
             d.level_db = rms_to_db(rms);
             d.sample_rate = sample_rate;
             d.channels = channels;
-        }
+        });
 
         let chunk_samples = ((sample_rate as f32) * chunk_secs) as usize;
         let hop_samples = ((sample_rate as f32) * hop_secs) as usize;
@@ -439,25 +496,25 @@ fn stt_worker_loop(
             let audio_end = (absolute_mono_offset + end as u64) as f64 / sample_rate as f64;
 
             if c_rms < min_rms {
-                let mut d = diag.lock().unwrap();
-                d.chunks_skipped_silence += 1;
-                d.stt_status = format!("silence skip (rms={c_rms:.4}) · listening…");
-                d.processed_audio_secs = audio_end as f32;
-                if d.chunks_skipped_silence % 5 == 1 {
-                    d.push_log(format!(
-                        "skip silence chunk @{audio_start:.1}s rms={c_rms:.4} (need ≥{min_rms})"
-                    ));
-                }
+                with_diag(&diag, |d| {
+                    d.chunks_skipped_silence += 1;
+                    d.stt_status = format!("silence skip (rms={c_rms:.4}) · listening…");
+                    d.processed_audio_secs = audio_end as f32;
+                    if d.chunks_skipped_silence % 5 == 1 {
+                        d.push_log(format!(
+                            "skip silence chunk @{audio_start:.1}s rms={c_rms:.4} (need ≥{min_rms})"
+                        ));
+                    }
+                });
                 cursor += hop_samples;
             } else {
-                {
-                    let mut d = diag.lock().unwrap();
+                with_diag(&diag, |d| {
                     d.stt_status = format!("transcribing {chunk_secs:.0}s @{audio_start:.1}s…");
                     d.push_log(format!(
                         "STT chunk @{audio_start:.1}-{audio_end:.1}s rms={c_rms:.4} samples={}",
                         chunk.len()
                     ));
-                }
+                });
 
                 let t0 = Instant::now();
                 let resampled = resample_linear(&chunk, sample_rate, TARGET_SAMPLE_RATE);
@@ -467,43 +524,38 @@ fn stt_worker_loop(
                 match result {
                     Ok(ts) => {
                         let text = ts.text.trim().to_string();
-                        let mut d = diag.lock().unwrap();
-                        d.chunks_processed += 1;
-                        d.last_stt_ms = Some(ms);
-                        d.processed_audio_secs = audio_end as f32;
-                        if text.is_empty() {
-                            d.stt_status = format!("empty text ({ms}ms) · listening…");
-                            d.push_log(format!(
-                                "STT empty @{audio_start:.1}s in {ms}ms (model heard silence/noise)"
-                            ));
-                        } else {
-                            d.segments_emitted += 1;
-                            d.stt_status = format!("ok · last \"{}\"", truncate(&text, 40));
-                            d.push_log(format!("STT +{ms}ms: {text}"));
-                            drop(d);
+                        with_diag(&diag, |d| {
+                            d.chunks_processed += 1;
+                            d.last_stt_ms = Some(ms);
+                            d.processed_audio_secs = audio_end as f32;
+                            if text.is_empty() {
+                                d.stt_status = format!("empty text ({ms}ms) · listening…");
+                                d.push_log(format!(
+                                    "STT empty @{audio_start:.1}s in {ms}ms (model heard silence/noise)"
+                                ));
+                            } else {
+                                d.segments_emitted += 1;
+                                d.stt_status = format!("ok · last \"{}\"", truncate(&text, 40));
+                                d.push_log(format!("STT +{ms}ms: {text}"));
+                            }
+                        });
+                        if !text.is_empty() {
                             if let Ok(mut q) = out_segments.lock() {
                                 q.push(SttSegment {
                                     text,
-                                    audio_start: session_start.elapsed().as_secs_f64()
-                                        - (audio_end - audio_start)
-                                        + audio_start.min(session_start.elapsed().as_secs_f64()),
-                                    // Prefer buffer-relative times
+                                    audio_start,
                                     audio_end,
                                 });
-                                // Fix start/end to buffer-relative which matches session if capture started with session
-                                if let Some(last) = q.last_mut() {
-                                    last.audio_start = audio_start;
-                                    last.audio_end = audio_end;
-                                }
                             }
                         }
                     }
                     Err(e) => {
-                        let mut d = diag.lock().unwrap();
-                        d.chunks_processed += 1;
-                        d.last_stt_ms = Some(ms);
-                        d.stt_status = format!("STT error: {e}");
-                        d.push_log(format!("ERROR STT @{audio_start:.1}s: {e}"));
+                        with_diag(&diag, |d| {
+                            d.chunks_processed += 1;
+                            d.last_stt_ms = Some(ms);
+                            d.stt_status = format!("STT error: {e}");
+                            d.push_log(format!("ERROR STT @{audio_start:.1}s: {e}"));
+                        });
                     }
                 }
                 cursor += hop_samples;
@@ -522,9 +574,65 @@ fn stt_worker_loop(
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    let mut d = diag.lock().unwrap();
-    d.stt_status = "stopped".into();
-    d.push_log("STT worker stopped");
+    // Drain any final feed the stop flag beat us to, then transcribe whatever
+    // tail audio was never chunked and emit it as one final segment before the
+    // thread returns so the recording side's post-join drain captures it all.
+    {
+        let leftover = take_samples(&samples);
+        if !leftover.is_empty() {
+            let usable = leftover.len() - (leftover.len() % ch);
+            if usable > 0 {
+                let mono = downmix_interleaved(&leftover[..usable], channels);
+                mono_history.extend_from_slice(&mono);
+            }
+        }
+    }
+    if mono_history.len() > cursor {
+        let tail_start = (absolute_mono_offset + cursor as u64) as f64 / sample_rate as f64;
+        let tail_end =
+            (absolute_mono_offset + mono_history.len() as u64) as f64 / sample_rate as f64;
+        let tail = mono_history[cursor..].to_vec();
+        let resampled = resample_linear(&tail, sample_rate, TARGET_SAMPLE_RATE);
+        let t0 = Instant::now();
+        match model.transcribe_samples(resampled) {
+            Ok(ts) => {
+                let text = ts.text.trim().to_string();
+                let ms = t0.elapsed().as_millis() as u64;
+                if !text.is_empty() {
+                    if let Ok(mut q) = out_segments.lock() {
+                        q.push(SttSegment {
+                            text: text.clone(),
+                            audio_start: tail_start,
+                            audio_end: tail_end,
+                        });
+                    }
+                    with_diag(&diag, |d| {
+                        d.segments_emitted += 1;
+                        d.last_stt_ms = Some(ms);
+                        d.stt_status = format!("ok · flushed tail \"{}\"", truncate(&text, 40));
+                        d.push_log(format!(
+                            "STT flush +{ms}ms @{tail_start:.1}-{tail_end:.1}s: {text}"
+                        ));
+                    });
+                } else {
+                    with_diag(&diag, |d| {
+                        d.last_stt_ms = Some(ms);
+                        d.push_log(format!("STT tail flush (empty text) @{tail_start:.1}s"));
+                    });
+                }
+            }
+            Err(e) => {
+                with_diag(&diag, |d| {
+                    d.push_log(format!("ERROR STT tail flush @{tail_start:.1}s: {e}"));
+                });
+            }
+        }
+    }
+
+    with_diag(&diag, |d| {
+        d.stt_status = "stopped".into();
+        d.push_log("STT worker stopped");
+    });
 }
 
 fn levels_only_loop(
@@ -539,10 +647,7 @@ fn levels_only_loop(
     let mut ring: Vec<f32> = Vec::new();
     let max_ring = (sample_rate.max(1) as usize).saturating_mul(2); // ~2s mono
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-        let chunk = {
-            let mut pending = samples.lock().unwrap();
-            std::mem::take(&mut *pending)
-        };
+        let chunk = take_samples(samples);
         if !chunk.is_empty() {
             let mono = downmix_interleaved(&chunk, channels);
             ring.extend_from_slice(&mono);
@@ -556,8 +661,7 @@ fn levels_only_loop(
             .saturating_sub(((sample_rate as f32) * 0.25) as usize);
         let recent = &ring[window..];
         let (rms, peak) = compute_rms_peak(recent);
-        {
-            let mut d = diag.lock().unwrap();
+        with_diag(diag, |d| {
             d.buffer_samples = ring.len();
             d.buffer_secs = ring.len() as f32 / sample_rate.max(1) as f32;
             d.rms = rms;
@@ -565,7 +669,7 @@ fn levels_only_loop(
             d.level_db = rms_to_db(rms);
             d.sample_rate = sample_rate;
             d.channels = channels;
-        }
+        });
         std::thread::sleep(Duration::from_millis(250));
     }
 }
@@ -597,6 +701,25 @@ mod tests {
         let input = vec![0.0, 1.0, 0.0, -1.0];
         let out = resample_linear(&input, 8_000, 16_000);
         assert_eq!(out.len(), 8);
+    }
+
+    #[test]
+    fn resample_downsample_halves_length() {
+        let input: Vec<f32> = (0..16_000).map(|i| ((i as f32) * 0.01).sin()).collect();
+        let out = resample_linear(&input, 16_000, 8_000);
+        assert_eq!(out.len(), 8_000);
+    }
+
+    #[test]
+    fn resample_downsample_high_freq_stays_bounded() {
+        let input: Vec<f32> = (0..16_000)
+            .map(|i| (2.0 * std::f64::consts::PI * 7000.0 * i as f64 / 16_000.0).sin() as f32)
+            .collect();
+        let out = resample_linear(&input, 16_000, 8_000);
+        assert_eq!(out.len(), 8_000);
+        assert!(out
+            .iter()
+            .all(|s| s.is_finite() && (-1.0..=1.0).contains(s)));
     }
 
     #[test]

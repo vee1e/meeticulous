@@ -85,7 +85,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         None => {
             let pool = db::open_meetily_database(&paths).await?;
+            let pool_after = pool.clone();
             tui::run_tui(paths, pool).await?;
+            db::cleanup(&pool_after).await?;
         }
         Some(Commands::Paths) => {
             print!("{}", format_paths_report(&paths));

@@ -1567,6 +1567,7 @@ dependencies = [
  "env_logger",
  "futures-util",
  "hound",
+ "libc",
  "log",
  "ndarray",
  "once_cell",

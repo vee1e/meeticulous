@@ -11,7 +11,8 @@ use sqlx::SqlitePool;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -43,6 +44,8 @@ pub struct RecordingHandle {
     pending_stt: SegmentQueue,
     /// Optional mic stream kept alive for the session lifetime.
     _mic_stream: Option<cpal::Stream>,
+    /// Mic writer thread draining the bounded channel; joined on stop.
+    _mic_writer: Option<std::thread::JoinHandle<()>>,
     /// macOS system-audio process tap (Meetily Core Audio path).
     #[cfg(target_os = "macos")]
     _system_audio: Option<crate::system_audio::SystemAudioSession>,
@@ -135,6 +138,7 @@ pub async fn start_recording(
             wav_writer.clone(),
             stt_samples.clone(),
             stop_flag.clone(),
+            diagnostics.clone(),
         ) {
             Ok(sess) => {
                 sample_rate = sess.sample_rate.max(1);
@@ -181,10 +185,7 @@ pub async fn start_recording(
     #[cfg(not(target_os = "macos"))]
     let system_up = false;
 
-    let mic_wav_writer = if system_up {
-        // Black-hole: open mic for status only, don't append into the meeting WAV.
-        Arc::new(Mutex::new(None))
-    } else {
+    if !system_up {
         // Mic-only path: open the live WAV before the capture stream starts.
         *wav_writer
             .lock()
@@ -197,35 +198,30 @@ pub async fn start_recording(
                 sample_rate
             ));
         }
-        wav_writer.clone()
-    };
-    let mic_stt_feed = if system_up {
-        Arc::new(Mutex::new(Vec::<f32>::new()))
-    } else {
-        stt_samples.clone()
-    };
+    }
 
-    let mic_stream = match start_cpal_capture(
-        mic_wav_writer,
-        mic_stt_feed,
+    let (mic_stream, mic_writer) = match start_cpal_capture(
+        wav_writer.clone(),
+        stt_samples.clone(),
         stop_flag.clone(),
         diagnostics.clone(),
         sample_rate,
+        system_up,
     ) {
-        Ok((stream, mic_sr, mic_ch)) => {
-            let _ = (mic_sr, mic_ch);
+        Ok(cap) => {
+            let _ = (cap.sample_rate, cap.channels);
             if system_up {
                 let mut d = diagnostics.lock().unwrap();
                 d.push_log("mic open for presence; STT uses SYSTEM AUDIO only (meeting playback)");
             }
-            stream
+            (cap.stream, cap.writer)
         }
         Err(e) => {
             let mut d = diagnostics.lock().unwrap();
             d.mic_ok = false;
             d.mic_error = Some(e.to_string());
             d.push_log(format!("MIC ERROR: {e}"));
-            None
+            (None, None)
         }
     };
 
@@ -266,6 +262,7 @@ pub async fn start_recording(
         diagnostics,
         pending_stt,
         _mic_stream: mic_stream,
+        _mic_writer: mic_writer,
         #[cfg(target_os = "macos")]
         _system_audio: system_audio,
         stt_join,
@@ -280,7 +277,8 @@ fn start_cpal_capture(
     stop_flag: Arc<AtomicBool>,
     diag: DiagHandle,
     target_rate: u32,
-) -> anyhow::Result<(Option<cpal::Stream>, u32, u16)> {
+    system_up: bool,
+) -> anyhow::Result<MicCapture> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -303,13 +301,17 @@ fn start_cpal_capture(
         ));
     }
 
+    // The cpal callback downmixes + resamples, then hands mono chunks to a
+    // dedicated writer thread over a bounded channel. A full channel drops the
+    // chunk rather than ever blocking the audio thread.
+    let (tx, rx) = std::sync::mpsc::sync_channel(64);
     let capture = CaptureContext {
-        wav_writer,
-        stt_samples,
+        tx,
         stop_flag,
         channels,
         from_rate: sample_rate,
         to_rate: target_rate,
+        system_up,
     };
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => build_stream_f32(&device, &stream_config, capture)?,
@@ -317,41 +319,74 @@ fn start_cpal_capture(
         cpal::SampleFormat::U16 => build_stream_u16(&device, &stream_config, capture)?,
         other => anyhow::bail!("unsupported sample format: {other:?}"),
     };
+    // Writer thread drains WAV + STT feed off the audio thread. Start before
+    // play() so no mic chunk is ever dropped. When system audio is up the mic
+    // callback returns immediately and no writer thread is needed.
+    let writer = if system_up {
+        None
+    } else {
+        std::thread::Builder::new()
+            .name("meeticulous-mic-writer".into())
+            .spawn(move || mic_writer_loop(rx, wav_writer, stt_samples, target_rate))
+            .ok()
+    };
     stream.play()?;
     {
         let mut d = diag.lock().unwrap();
         d.push_log("mic stream playing (mixed with system when available)");
     }
-    Ok((Some(stream), sample_rate, channels))
+    Ok(MicCapture {
+        stream: Some(stream),
+        writer,
+        sample_rate,
+        channels,
+    })
 }
 
-/// Downmix + optional resample, then append into shared mono buffer.
+/// What the mic capture setup returned: the live stream, its writer thread, the
+/// device's own sample rate and channel count.
+struct MicCapture {
+    stream: Option<cpal::Stream>,
+    writer: Option<std::thread::JoinHandle<()>>,
+    sample_rate: u32,
+    channels: u16,
+}
+
+/// Downmix + resample in the cpal callback, then send mono chunks to the writer
+/// thread via a bounded channel (never blocks the audio thread).
 struct CaptureContext {
-    wav_writer: LiveWavWriter,
-    stt_samples: Arc<Mutex<Vec<f32>>>,
+    tx: SyncSender<Vec<f32>>,
     stop_flag: Arc<AtomicBool>,
     channels: u16,
     from_rate: u32,
     to_rate: u32,
+    system_up: bool,
 }
 
-fn push_mixed_mono(
-    wav_writer: &LiveWavWriter,
-    stt_samples: &Arc<Mutex<Vec<f32>>>,
-    interleaved: &[f32],
-    channels: u16,
-    from_rate: u32,
-    to_rate: u32,
+impl CaptureContext {
+    fn mono_chunk(&self, interleaved: &[f32]) -> Vec<f32> {
+        let mono = crate::stt::downmix_interleaved(interleaved, self.channels);
+        if self.from_rate != self.to_rate && self.to_rate > 0 {
+            crate::stt::resample_linear(&mono, self.from_rate, self.to_rate)
+        } else {
+            mono
+        }
+    }
+}
+
+/// Drain mic chunks off the audio thread: WAV append + STT feed extend.
+/// Exits when the channel disconnects (mic stream dropped on stop).
+fn mic_writer_loop(
+    rx: Receiver<Vec<f32>>,
+    wav_writer: LiveWavWriter,
+    stt_samples: Arc<Mutex<Vec<f32>>>,
+    sample_rate: u32,
 ) {
-    let mono = crate::stt::downmix_interleaved(interleaved, channels);
-    let mono = if from_rate != to_rate && to_rate > 0 {
-        crate::stt::resample_linear(&mono, from_rate, to_rate)
-    } else {
-        mono
-    };
-    append_wav_samples(wav_writer, &mono);
-    if let Ok(mut feed) = stt_samples.lock() {
-        feed.extend_from_slice(&mono);
+    while let Ok(chunk) = rx.recv() {
+        append_wav_samples(&wav_writer, &chunk);
+        if let Ok(mut feed) = stt_samples.lock() {
+            extend_stt_feed(&mut feed, &chunk, sample_rate);
+        }
     }
 }
 
@@ -364,17 +399,11 @@ fn build_stream_f32(
     let stream = device.build_input_stream(
         config,
         move |data: &[f32], _| {
-            if capture.stop_flag.load(Ordering::Relaxed) {
+            if capture.stop_flag.load(Ordering::Relaxed) || capture.system_up {
                 return;
             }
-            push_mixed_mono(
-                &capture.wav_writer,
-                &capture.stt_samples,
-                data,
-                capture.channels,
-                capture.from_rate,
-                capture.to_rate,
-            );
+            let mono = capture.mono_chunk(data);
+            let _ = capture.tx.try_send(mono);
         },
         err_fn,
         None,
@@ -391,18 +420,12 @@ fn build_stream_i16(
     let stream = device.build_input_stream(
         config,
         move |data: &[i16], _| {
-            if capture.stop_flag.load(Ordering::Relaxed) {
+            if capture.stop_flag.load(Ordering::Relaxed) || capture.system_up {
                 return;
             }
             let f: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-            push_mixed_mono(
-                &capture.wav_writer,
-                &capture.stt_samples,
-                &f,
-                capture.channels,
-                capture.from_rate,
-                capture.to_rate,
-            );
+            let mono = capture.mono_chunk(&f);
+            let _ = capture.tx.try_send(mono);
         },
         err_fn,
         None,
@@ -419,21 +442,15 @@ fn build_stream_u16(
     let stream = device.build_input_stream(
         config,
         move |data: &[u16], _| {
-            if capture.stop_flag.load(Ordering::Relaxed) {
+            if capture.stop_flag.load(Ordering::Relaxed) || capture.system_up {
                 return;
             }
             let f: Vec<f32> = data
                 .iter()
                 .map(|&s| (s as f32 - 32768.0) / 32768.0)
                 .collect();
-            push_mixed_mono(
-                &capture.wav_writer,
-                &capture.stt_samples,
-                &f,
-                capture.channels,
-                capture.from_rate,
-                capture.to_rate,
-            );
+            let mono = capture.mono_chunk(&f);
+            let _ = capture.tx.try_send(mono);
         },
         err_fn,
         None,
@@ -454,16 +471,37 @@ pub async fn drain_stt_segments(
         std::mem::take(&mut *q)
     };
     let mut out = Vec::new();
-    for p in pending {
-        let seg = append_text_segment(
+    let mut idx = 0;
+    while idx < pending.len() {
+        let p = pending[idx].clone();
+        match append_text_segment(
             pool,
             handle,
             &p.text,
             Some(p.audio_start),
             Some(p.audio_end),
         )
-        .await?;
-        out.push(seg);
+        .await
+        {
+            Ok(seg) => out.push(seg),
+            Err(e) => {
+                // Re-queue the failed + remaining segments so nothing is lost.
+                let requeue = &pending[idx..];
+                let n = requeue.len();
+                if let Ok(mut q) = handle.pending_stt.lock() {
+                    for seg in requeue.iter().rev() {
+                        q.insert(0, seg.clone());
+                    }
+                }
+                if let Ok(mut d) = handle.diagnostics.lock() {
+                    d.push_log(format!(
+                        "ERROR draining STT segments — requeued {n} for retry: {e}"
+                    ));
+                }
+                return Err(e);
+            }
+        }
+        idx += 1;
     }
     Ok(out)
 }
@@ -476,7 +514,7 @@ pub async fn append_text_segment(
     audio_start: Option<f64>,
     audio_end: Option<f64>,
 ) -> anyhow::Result<LiveSegment> {
-    let ts = Utc::now().to_rfc3339();
+    let ts = chrono::Local::now().format("%H:%M:%S").to_string();
     let start = audio_start.unwrap_or_else(|| handle.elapsed_secs());
     let end = audio_end.unwrap_or(start);
     let duration = (end - start).max(0.0);
@@ -530,25 +568,47 @@ pub async fn stop_recording(
     mut handle: RecordingHandle,
     selection: &ModelSelection,
 ) -> anyhow::Result<Meeting> {
-    // Drain any remaining STT first
-    let _ = drain_stt_segments(pool, &handle).await;
-
     handle.stop_flag.store(true, Ordering::SeqCst);
-    // Drop capture streams so callbacks stop feeding the buffer
+    // Drop capture streams so callbacks stop feeding the buffers.
     handle._mic_stream = None;
     #[cfg(target_os = "macos")]
     {
         handle._system_audio = None;
     }
-    // Join STT worker (bounded wait so UI never hangs forever)
+
+    // Join the mic writer thread so queued mic chunks reach the WAV + STT feed.
+    if let Some(writer) = handle._mic_writer.take() {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                let _ = writer.join();
+            }),
+        )
+        .await;
+    }
+
+    // Join the STT worker for real: it flushes its final tail transcription into
+    // the pending queue before returning. Bounded wait so the UI never hangs.
     if let Some(join) = handle.stt_join.take() {
-        let _ = std::thread::spawn(move || {
-            let _ = join.join();
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let joined = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            tokio::task::spawn_blocking(move || {
+                let _ = join.join();
+            }),
+        )
+        .await;
+        if joined.is_err() {
+            if let Ok(mut d) = handle.diagnostics.lock() {
+                d.push_log("WARN: STT worker join timed out after 20s — continuing best-effort");
+            }
+        }
     } else {
+        // No STT worker (disabled / spawn failed); nothing to join.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+
+    // Drain the segments the STT worker flushed as its final tail transcription.
+    let _ = drain_stt_segments(pool, &handle).await;
 
     let writer = handle
         .wav_writer
@@ -610,6 +670,9 @@ pub(crate) fn create_wav_writer(
     Ok(WavWriter::new(buffered, spec)?)
 }
 
+/// Samples written since the last WAV header checkpoint (crash-safety flush).
+static SAMPLES_SINCE_FLUSH: AtomicUsize = AtomicUsize::new(0);
+
 /// Append mono f32 samples to the live meeting WAV. Unbounded — no rolling cap.
 pub(crate) fn append_wav_samples(writer: &LiveWavWriter, samples: &[f32]) {
     let Ok(mut guard) = writer.lock() else {
@@ -624,6 +687,26 @@ pub(crate) fn append_wav_samples(writer: &LiveWavWriter, samples: &[f32]) {
         if writer.write_sample(i).is_err() {
             break;
         }
+    }
+    // Checkpoint the WAV header ~once per second (48k mono samples) so a crash
+    // mid-meeting leaves a playable file (hound flush rewrites the data length).
+    const FLUSH_INTERVAL: usize = 48_000;
+    if SAMPLES_SINCE_FLUSH.fetch_add(samples.len(), Ordering::Relaxed) + samples.len()
+        >= FLUSH_INTERVAL
+    {
+        let _ = writer.flush();
+        SAMPLES_SINCE_FLUSH.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Extend the STT feed, trimming the oldest samples so it never exceeds ~60s
+/// of audio even when the STT worker lags behind the capture threads.
+pub(crate) fn extend_stt_feed(feed: &mut Vec<f32>, samples: &[f32], sample_rate: u32) {
+    feed.extend_from_slice(samples);
+    let cap = (sample_rate.max(1) as usize).saturating_mul(60);
+    if feed.len() > cap {
+        let drop_n = feed.len() - cap;
+        feed.drain(0..drop_n);
     }
 }
 
@@ -670,32 +753,24 @@ pub async fn import_audio_file(
     std::fs::copy(audio_path, &dest)?;
 
     let meeting_id = create_meeting(pool, &title, Some(&folder_path.to_string_lossy())).await?;
-    for (i, line) in transcript_lines.iter().enumerate() {
-        let ts = Utc::now().to_rfc3339();
-        let start = i as f64 * 2.0;
-        append_transcript_segment(
-            pool,
-            &meeting_id,
-            line,
-            &ts,
-            Some(start),
-            Some(start + 2.0),
-            Some(2.0),
-            None,
-        )
-        .await?;
-    }
-    let full = transcript_lines.join("\n");
-    upsert_transcript_chunk(
+    match crate::db::import_meeting_with_segments(
         pool,
         &meeting_id,
         &title,
-        &full,
+        transcript_lines,
         selection.provider.as_str(),
         &selection.model,
     )
-    .await?;
-    Ok(meeting_id)
+    .await
+    {
+        Ok(()) => Ok(meeting_id),
+        Err(e) => {
+            // Best-effort rollback: remove the meeting + copied audio.
+            let _ = crate::db::delete_meeting(pool, &meeting_id).await;
+            let _ = std::fs::remove_file(&dest);
+            Err(e.into())
+        }
+    }
 }
 
 #[cfg(test)]

@@ -55,8 +55,6 @@ pub struct MeetilyPaths {
     pub parakeet_models_dir: PathBuf,
     pub summary_models_dir: PathBuf,
     pub recordings_dir: PathBuf,
-    pub recording_preferences_path: PathBuf,
-    pub preferences_path: PathBuf,
 }
 
 impl MeetilyPaths {
@@ -85,8 +83,6 @@ impl MeetilyPaths {
             parakeet_models_dir: models_dir.join(PARAKEET_MODELS_DIRNAME),
             summary_models_dir: models_dir.join(SUMMARY_MODELS_DIRNAME),
             models_dir,
-            recording_preferences_path: app_data_dir.join(RECORDING_PREFERENCES_FILENAME),
-            preferences_path: app_data_dir.join(PREFERENCES_FILENAME),
             app_data_dir,
             recordings_dir,
         }
@@ -130,8 +126,10 @@ pub fn default_recordings_dir() -> PathBuf {
         movies.join(RECORDINGS_DIRNAME)
     } else if let Some(docs) = dirs::document_dir() {
         docs.join(RECORDINGS_DIRNAME)
+    } else if let Some(home) = dirs::home_dir() {
+        home.join("Movies").join(RECORDINGS_DIRNAME)
     } else {
-        PathBuf::from(".").join(RECORDINGS_DIRNAME)
+        PathBuf::from("/").join(RECORDINGS_DIRNAME)
     }
 }
 

@@ -15,7 +15,6 @@ pub use transcripts::*;
 use crate::paths::MeetilyPaths;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
-use std::str::FromStr;
 
 /// Open (or create) the Meetily database at the given path and apply schema.
 pub async fn open_database(db_path: &std::path::Path) -> anyhow::Result<SqlitePool> {
@@ -23,8 +22,8 @@ pub async fn open_database(db_path: &std::path::Path) -> anyhow::Result<SqlitePo
         std::fs::create_dir_all(parent)?;
     }
 
-    let url = format!("sqlite:{}?mode=rwc", db_path.display());
-    let options = SqliteConnectOptions::from_str(&url)?
+    let options = SqliteConnectOptions::new()
+        .filename(db_path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true);
@@ -42,7 +41,12 @@ pub async fn open_database(db_path: &std::path::Path) -> anyhow::Result<SqlitePo
 pub async fn open_meetily_database(paths: &MeetilyPaths) -> anyhow::Result<SqlitePool> {
     // Prefer existing sqlite; if only legacy .db exists, copy like Meetily does.
     if !paths.db_path.exists() && paths.legacy_db_path.exists() {
-        std::fs::copy(&paths.legacy_db_path, &paths.db_path)?;
+        if let Err(e) = std::fs::copy(&paths.legacy_db_path, &paths.db_path) {
+            log::warn!(
+                "failed to copy legacy db {}: {e}",
+                paths.legacy_db_path.display()
+            );
+        }
     }
     open_database(&paths.db_path).await
 }
@@ -139,54 +143,72 @@ pub async fn apply_schema(pool: &SqlitePool) -> anyhow::Result<()> {
             updated_at TEXT NOT NULL,
             FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
         );
+
+        CREATE INDEX IF NOT EXISTS idx_transcripts_meeting_id ON transcripts(meeting_id);
+        CREATE INDEX IF NOT EXISTS idx_meetings_created_at ON meetings(created_at);
         "#,
     )
     .execute(pool)
     .await?;
 
     // Best-effort column adds for older empty test DBs created with partial schema.
-    let _ = sqlx::query("ALTER TABLE meetings ADD COLUMN folder_path TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN audio_start_time REAL")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN audio_end_time REAL")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN duration REAL")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN speaker TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE settings ADD COLUMN openRouterApiKey TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE settings ADD COLUMN ollamaEndpoint TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE settings ADD COLUMN customOpenAIConfig TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE settings ADD COLUMN geminiApiKey TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE summary_processes ADD COLUMN result_backup TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE summary_processes ADD COLUMN result_backup_timestamp TEXT")
-        .execute(pool)
-        .await;
+    // Real Meetily DBs already have these columns, so "duplicate column name" is benign.
+    alter_table_add_column(pool, "ALTER TABLE meetings ADD COLUMN folder_path TEXT").await;
+    alter_table_add_column(
+        pool,
+        "ALTER TABLE transcripts ADD COLUMN audio_start_time REAL",
+    )
+    .await;
+    alter_table_add_column(
+        pool,
+        "ALTER TABLE transcripts ADD COLUMN audio_end_time REAL",
+    )
+    .await;
+    alter_table_add_column(pool, "ALTER TABLE transcripts ADD COLUMN duration REAL").await;
+    alter_table_add_column(pool, "ALTER TABLE transcripts ADD COLUMN speaker TEXT").await;
+    alter_table_add_column(
+        pool,
+        "ALTER TABLE settings ADD COLUMN openRouterApiKey TEXT",
+    )
+    .await;
+    alter_table_add_column(pool, "ALTER TABLE settings ADD COLUMN ollamaEndpoint TEXT").await;
+    alter_table_add_column(
+        pool,
+        "ALTER TABLE settings ADD COLUMN customOpenAIConfig TEXT",
+    )
+    .await;
+    alter_table_add_column(pool, "ALTER TABLE settings ADD COLUMN geminiApiKey TEXT").await;
+    alter_table_add_column(
+        pool,
+        "ALTER TABLE summary_processes ADD COLUMN result_backup TEXT",
+    )
+    .await;
+    alter_table_add_column(
+        pool,
+        "ALTER TABLE summary_processes ADD COLUMN result_backup_timestamp TEXT",
+    )
+    .await;
 
     Ok(())
 }
 
+async fn alter_table_add_column(pool: &SqlitePool, sql: &str) {
+    if let Err(e) = sqlx::query(sql).execute(pool).await {
+        if e.to_string().contains("duplicate column name") {
+            return;
+        }
+        log::warn!("apply_schema ALTER failed: {e}");
+    }
+}
+
 /// Graceful WAL checkpoint + pool close.
 pub async fn cleanup(pool: &SqlitePool) -> anyhow::Result<()> {
-    let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+    if let Err(e) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
         .execute(pool)
-        .await;
+        .await
+    {
+        log::warn!("wal_checkpoint(TRUNCATE) failed: {e}");
+    }
     pool.close().await;
     Ok(())
 }
