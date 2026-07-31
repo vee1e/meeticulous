@@ -34,7 +34,7 @@ pub enum ParakeetError {
     Ort(#[from] ort::Error),
     #[error("I/O error")]
     Io(#[from] std::io::Error),
-    #[error("ndarray shape error")]
+    #[error("ndarray shape error: {0}")]
     Shape(#[from] ndarray::ShapeError),
     #[error("Model input not found: {0}")]
     InputNotFound(String),
@@ -114,16 +114,15 @@ impl ParakeetModel {
         let decoder_enc_input_rank = dec_enc_shape.len();
         if decoder_enc_input_rank != 3 {
             return Err(ParakeetError::TensorShape(format!(
-                "decoder 'encoder_outputs' input has rank {decoder_enc_input_rank} (expected 3, batch×time×hidden): {dec_enc_shape:?}"
+                "decoder 'encoder_outputs' input has rank {decoder_enc_input_rank} (expected rank 3, e.g. [batch, hidden, time] or [batch, time, hidden]): {dec_enc_shape:?}"
             )));
         }
+        // Derive the hidden axis from the decoder's own metadata. Exported
+        // Parakeet TDT decoders declare this as [batch, hidden, time]
+        // (e.g. [-1, 1024, -1]) or [batch, time, hidden]; we must accept
+        // whichever the model pins down rather than assuming hidden is last.
         let (decoder_enc_hidden_axis, decoder_enc_hidden_size) =
             hidden_axis_and_size(dec_enc_shape);
-        if decoder_enc_hidden_axis != 2 {
-            return Err(ParakeetError::TensorShape(format!(
-                "decoder 'encoder_outputs' input shape {dec_enc_shape:?} is not [batch, time, hidden]; hidden must be the last axis"
-            )));
-        }
         for (i, &d) in dec_enc_shape.iter().enumerate() {
             if i != decoder_enc_hidden_axis && d > 1 {
                 return Err(ParakeetError::TensorShape(format!(
@@ -385,7 +384,14 @@ impl ParakeetModel {
         if shape[2] == hidden {
             Ok(encoder_output)
         } else if shape[1] == hidden {
-            Ok(encoder_output.permuted_axes(IxDyn(&[0, 2, 1])))
+            // permuted_axes keeps the array in its original (permuted) memory
+            // order, and to_owned()'s fast path preserves those strides, so
+            // materialize a true C-contiguous copy by iterating in logical
+            // order to keep timestep slices contiguous for decode_step.
+            let permuted = encoder_output.permuted_axes(IxDyn(&[0, 2, 1]));
+            let dim = permuted.raw_dim();
+            let data: Vec<f32> = permuted.iter().copied().collect();
+            Array::from_shape_vec(dim, data).map_err(ParakeetError::Shape)
         } else {
             Err(ParakeetError::TensorShape(format!(
                 "encoder output shape {shape:?} does not put the decoder's hidden size {hidden} on the time or hidden axis"
@@ -448,8 +454,9 @@ impl ParakeetModel {
         let target_token = prev_tokens.last().copied().unwrap_or(self.blank_idx);
 
         // Build encoder_outputs to exactly match the decoder's expected input
-        // layout ([batch=1, time=1, hidden]) derived from session metadata,
-        // reusing a scratch buffer instead of allocating per timestep.
+        // layout derived from session metadata: batch=time=1 with the hidden
+        // dim on the decoder's declared hidden axis (e.g. [1, 1024, 1] for a
+        // [batch, hidden, time] decoder). Reuses a scratch buffer per step.
         let features = encoder_out.len();
         if let Some(hidden) = self.decoder_enc_hidden_size {
             if features != hidden {
@@ -473,7 +480,7 @@ impl ParakeetModel {
         dst.copy_from_slice(src);
 
         let targets = Array2::from_shape_vec((1, 1), vec![target_token])?;
-        let target_length = Array1::<i64>::from_vec(vec![1]);
+        let target_length = Array1::<i32>::from_vec(vec![1]);
 
         let inputs = inputs![
             "encoder_outputs" => TensorRef::from_array_view(self.enc_scratch.view())?,
@@ -706,5 +713,42 @@ impl ParakeetModel {
         })?;
 
         Ok(timestamped_result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_axis_detects_middle_hidden_layout() {
+        // Parakeet TDT exports decoder 'encoder_outputs' as [batch, hidden, time].
+        let (axis, size) = hidden_axis_and_size(&[-1, 1024, -1]);
+        assert_eq!(axis, 1);
+        assert_eq!(size, Some(1024));
+    }
+
+    #[test]
+    fn hidden_axis_detects_last_hidden_layout() {
+        let (axis, size) = hidden_axis_and_size(&[-1, -1, 1024]);
+        assert_eq!(axis, 2);
+        assert_eq!(size, Some(1024));
+    }
+
+    #[test]
+    fn hidden_axis_handles_pinned_batch_and_dynamic_others() {
+        let (axis, size) = hidden_axis_and_size(&[1, 1024, -1]);
+        assert_eq!(axis, 1);
+        assert_eq!(size, Some(1024));
+        let (axis, size) = hidden_axis_and_size(&[-1, 1024, 1]);
+        assert_eq!(axis, 1);
+        assert_eq!(size, Some(1024));
+    }
+
+    #[test]
+    fn hidden_axis_defaults_to_last_on_fully_dynamic() {
+        let (axis, size) = hidden_axis_and_size(&[-1, -1, -1]);
+        assert_eq!(axis, 2);
+        assert_eq!(size, None);
     }
 }
