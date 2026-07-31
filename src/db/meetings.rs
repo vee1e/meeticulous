@@ -62,6 +62,25 @@ pub async fn update_meeting_title(
     Ok(res.rows_affected() > 0)
 }
 
+/// Rename multiple meetings in one transaction: `(meeting_id, new_title)`.
+pub async fn rename_meetings(
+    pool: &SqlitePool,
+    renames: &[(String, String)],
+) -> Result<usize, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let now = Utc::now().to_rfc3339();
+    for (id, title) in renames {
+        sqlx::query("UPDATE meetings SET title = ?, updated_at = ? WHERE id = ?")
+            .bind(title)
+            .bind(&now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(renames.len())
+}
+
 /// Touch updated_at.
 pub async fn touch_meeting(pool: &SqlitePool, meeting_id: &str) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;

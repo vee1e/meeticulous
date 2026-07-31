@@ -272,4 +272,32 @@ mod tests {
         assert_eq!(format_media_timestamp(3600.0), "01:00:00");
         assert_eq!(format_media_timestamp(3661.0), "01:01:01");
     }
+
+    #[tokio::test]
+    async fn bulk_rename_meetings_in_one_transaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("com.meetily.ai");
+        let rec = tmp.path().join("Movies").join("meetily-recordings");
+        let paths = MeetilyPaths::with_dirs(app, rec);
+        paths.ensure_dirs().unwrap();
+
+        let pool = open_database(&paths.db_path).await.unwrap();
+        let a = create_meeting(&pool, "Old A", None).await.unwrap();
+        let b = create_meeting(&pool, "Old B", None).await.unwrap();
+
+        let renames = vec![
+            (a.clone(), "New A".to_string()),
+            (b.clone(), "New B".to_string()),
+        ];
+        let n = rename_meetings(&pool, &renames).await.unwrap();
+        assert_eq!(n, 2);
+
+        let all = list_meetings(&pool).await.unwrap();
+        assert_eq!(all.len(), 2);
+        for m in all {
+            let expected = if m.id == a { "New A" } else { "New B" };
+            assert_eq!(m.title, expected);
+        }
+        cleanup(&pool).await.unwrap();
+    }
 }

@@ -78,6 +78,7 @@ meeticulous --paths   # print resolved roots
 ### Meetings
 - List / open / delete (confirm with `y`)
 - Transcript view with scroll + timestamps
+- Rename a title with `e`, or bulk-rename all titles with `E` — both open `$EDITOR` (nvim by default), one title per line
 - Summaries stored in Meetily’s `summary_processes` table
 
 ### Summarization (CLI only)
@@ -98,6 +99,8 @@ meeticulous --paths   # print resolved roots
 | `r` | start recording |
 | `s` | regenerate summary (context screen) |
 | `v` | open saved summary |
+| `e` | rename meeting title (opens `$EDITOR`/nvim) |
+| `E` | bulk-rename all meeting titles in `$EDITOR`/nvim (one per line) |
 | `d` | delete (confirm `y`) |
 | `c` | copy summary plaintext (when viewing) |
 | `m` | models / backend |
@@ -113,6 +116,7 @@ meeticulous --paths   # print resolved roots
 | `gg` / `G` | top / bottom |
 | `s` | regenerate summary |
 | `c` | copy summary body |
+| `e` | rename this meeting's title (opens `$EDITOR`/nvim) |
 | `t` | transcript (from summary) |
 | `h` / `Esc` | back |
 
