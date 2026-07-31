@@ -25,6 +25,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::io::stdout;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -106,6 +107,8 @@ pub struct App {
     /// Meeting id pending delete confirmation.
     pending_delete_id: Option<String>,
     pending_delete_title: String,
+    /// Meeting currently open in the Transcript / Summary view (for `e` rename).
+    current_meeting_id: Option<String>,
     /// Text buffer for summary context / recording append (shared input).
     input_buf: String,
     /// Background summarize job.
@@ -152,7 +155,7 @@ impl App {
             summary_text: String::new(),
             summary_lines: Vec::new(),
             summary_meta: String::new(),
-            status: "hjkl · Enter/l open (summary) · t transcript · s regen · c copy · d del · q"
+            status: "hjkl · Enter/l open (summary) · t transcript · s regen · c copy · e rename · E bulk · d del · q"
                 .into(),
             model_selection,
             models_list: Vec::new(),
@@ -163,6 +166,7 @@ impl App {
             summary_prefs,
             pending_delete_id: None,
             pending_delete_title: String::new(),
+            current_meeting_id: None,
             input_buf: String::new(),
             summary_job: None,
             summary_spin: 0,
@@ -241,6 +245,7 @@ impl App {
         if let Some(m) = self.selected_meeting() {
             let id = m.id.clone();
             let title = m.title.clone();
+            self.current_meeting_id = Some(id.clone());
             self.transcript_text = db::load_transcript_text(&self.pool, &id).await?;
             if self.transcript_text.trim().is_empty() {
                 self.transcript_text = "(no transcript segments)".into();
@@ -249,7 +254,7 @@ impl App {
             self.pending_g = false;
             self.screen = Screen::Transcript;
             self.status = format!(
-                "Transcript: {title}  j/k scroll · gg/G · C-d/u · s sum · d del · h/Esc back"
+                "Transcript: {title}  j/k scroll · gg/G · C-d/u · s sum · e rename · d del · h/Esc back"
             );
         }
         Ok(())
@@ -617,11 +622,12 @@ impl App {
     async fn load_summary_for_meeting(&mut self, id: &str, title: &str) -> anyhow::Result<bool> {
         match db::load_summary_plain_text(&self.pool, id).await? {
             Some((body, status)) => {
+                self.current_meeting_id = Some(id.to_string());
                 self.set_summary_body(body, format!("saved in Meetily DB · status={status}"));
                 self.pending_g = false;
                 self.screen = Screen::Summary;
                 self.status = format!(
-                    "Summary: {title}  j/k scroll · s regenerate · c copy · t transcript · h back"
+                    "Summary: {title}  j/k scroll · s regenerate · c copy · t transcript · e rename · h back"
                 );
                 Ok(true)
             }
@@ -785,6 +791,78 @@ impl App {
         );
     }
 
+    /// Rename the currently selected meeting's title via the external editor.
+    async fn rename_selected_title(&mut self, term: &mut TermGuard) -> anyhow::Result<()> {
+        let Some(m) = self.selected_meeting() else {
+            self.status = "Select a meeting first".into();
+            return Ok(());
+        };
+        self.rename_meeting_title(term, m.id.clone(), m.title.clone())
+            .await
+    }
+
+    /// Rename one meeting title via the external editor.
+    async fn rename_meeting_title(
+        &mut self,
+        term: &mut TermGuard,
+        id: String,
+        old: String,
+    ) -> anyhow::Result<()> {
+        let edited = edit_text_external(term, &format!("{old}\n")).await?;
+        let new = edited.trim().to_string();
+        if new.is_empty() {
+            self.status = "Rename aborted — title cannot be empty".into();
+            return Ok(());
+        }
+        if new == old {
+            self.status = "Title unchanged".into();
+            return Ok(());
+        }
+        db::update_meeting_title(&self.pool, &id, &new).await?;
+        self.refresh_meetings().await?;
+        self.status = format!("Renamed “{old}” → “{new}”");
+        Ok(())
+    }
+
+    /// Bulk-rename every meeting title via the external editor (one per line).
+    async fn bulk_rename_titles(&mut self, term: &mut TermGuard) -> anyhow::Result<()> {
+        if self.meetings.is_empty() {
+            self.status = "No meetings to rename".into();
+            return Ok(());
+        }
+        let orig: Vec<String> = self.meetings.iter().map(|m| m.title.clone()).collect();
+        let initial: String = orig.iter().map(|t| format!("{t}\n")).collect();
+        let edited = edit_text_external(term, &initial).await?;
+        let mut lines: Vec<&str> = edited.split('\n').collect();
+        if lines.last() == Some(&"") {
+            lines.pop();
+        }
+        let plan = match plan_bulk_renames(&orig, &lines) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("Bulk rename aborted — nothing applied: {e}");
+                return Ok(());
+            }
+        };
+        if plan.is_empty() {
+            self.status = "No titles changed".into();
+            return Ok(());
+        }
+        let ids: Vec<(String, String)> = plan
+            .iter()
+            .map(|(i, t)| (self.meetings[*i].id.clone(), t.clone()))
+            .collect();
+        db::rename_meetings(&self.pool, &ids).await?;
+        let changed = plan
+            .iter()
+            .map(|(i, t)| format!("“{}”→“{t}”", orig[*i]))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.refresh_meetings().await?;
+        self.status = format!("Renamed {} meeting(s): {changed}", plan.len());
+        Ok(())
+    }
+
     fn cancel_summary_job(&mut self) {
         if let Some(job) = self.summary_job.take() {
             job.abort();
@@ -805,6 +883,24 @@ impl TermGuard {
         let _ = stdout().execute(EnterAlternateScreen);
         TermGuard { active: true }
     }
+
+    /// Leave raw mode + alternate screen (e.g. to hand the terminal to an editor).
+    fn suspend(&mut self) {
+        if self.active {
+            let _ = disable_raw_mode();
+            let _ = stdout().execute(LeaveAlternateScreen);
+            self.active = false;
+        }
+    }
+
+    /// Re-enter raw mode + alternate screen after an external editor session.
+    fn rearm(&mut self) {
+        if !self.active {
+            let _ = enable_raw_mode();
+            let _ = stdout().execute(EnterAlternateScreen);
+            self.active = true;
+        }
+    }
 }
 
 impl Drop for TermGuard {
@@ -818,7 +914,7 @@ impl Drop for TermGuard {
 
 /// Run the interactive TUI (macOS terminal).
 pub async fn run_tui(paths: MeetilyPaths, pool: SqlitePool) -> anyhow::Result<()> {
-    let guard = TermGuard::arm();
+    let mut guard = TermGuard::arm();
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let mut app = App::new(paths, pool).await?;
@@ -843,7 +939,7 @@ pub async fn run_tui(paths: MeetilyPaths, pool: SqlitePool) -> anyhow::Result<()
 
             if event::poll(Duration::from_millis(poll_ms))? {
                 if let Event::Key(key) = event::read()? {
-                    if let Err(e) = handle_key(&mut app, key).await {
+                    if let Err(e) = handle_key(&mut app, &mut guard, key).await {
                         app.status = format!("error: {e}");
                     }
                 }
@@ -867,7 +963,11 @@ pub async fn run_tui(paths: MeetilyPaths, pool: SqlitePool) -> anyhow::Result<()
     result
 }
 
-async fn handle_key(app: &mut App, key: event::KeyEvent) -> anyhow::Result<()> {
+async fn handle_key(
+    app: &mut App,
+    term: &mut TermGuard,
+    key: event::KeyEvent,
+) -> anyhow::Result<()> {
     if key.kind != KeyEventKind::Press {
         return Ok(());
     }
@@ -1063,6 +1163,17 @@ async fn handle_key(app: &mut App, key: event::KeyEvent) -> anyhow::Result<()> {
                     app.pending_g = false;
                     app.open_transcript().await?;
                 }
+                (false, KeyCode::Char('e')) => {
+                    app.pending_g = false;
+                    if let Some(id) = app.current_meeting_id.clone() {
+                        match db::get_meeting(&app.pool, &id).await? {
+                            Some(m) => app.rename_meeting_title(term, id, m.title.clone()).await?,
+                            None => app.status = "Meeting not found".into(),
+                        }
+                    } else {
+                        app.status = "No meeting open".into();
+                    }
+                }
                 (false, KeyCode::Char('d')) | (_, KeyCode::Delete) => {
                     app.pending_g = false;
                     app.begin_delete_confirm();
@@ -1171,6 +1282,14 @@ async fn handle_key(app: &mut App, key: event::KeyEvent) -> anyhow::Result<()> {
                 KeyCode::Char('c') => {
                     app.pending_g = false;
                     app.view_cached_summary().await?;
+                }
+                KeyCode::Char('e') => {
+                    app.pending_g = false;
+                    app.rename_selected_title(term).await?;
+                }
+                KeyCode::Char('E') => {
+                    app.pending_g = false;
+                    app.bulk_rename_titles(term).await?;
                 }
                 KeyCode::Char('d') | KeyCode::Delete if !ctrl => {
                     app.pending_g = false;
@@ -1281,7 +1400,7 @@ fn draw_meetings(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     };
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(
-            "Meetings  j/k · l/Enter summary · t transcript · r rec · s regen · c copy · d del · q",
+            "Meetings  j/k · l/Enter summary · t transcript · r rec · s regen · e rename · E bulk · d del · q",
         ))
         .highlight_style(
             Style::default()
@@ -1680,4 +1799,163 @@ fn draw_delete_confirm(f: &mut ratatui::Frame, app: &App, area: Rect) {
                 )),
         );
     f.render_widget(p, area);
+}
+
+/// Re-enter the terminal after an external editor session, even on early
+/// return or panic.
+struct RearmGuard<'a>(&'a mut TermGuard);
+
+impl Drop for RearmGuard<'_> {
+    fn drop(&mut self) {
+        self.0.rearm();
+    }
+}
+
+/// Resolve the editor to run: `$EDITOR` → `$VISUAL` → `nvim`/`vim`/`vi` on PATH.
+/// Returns `(program, extra args)` so a value like `EDITOR="code --wait"` works.
+fn editor_parts() -> Option<(String, Vec<String>)> {
+    for var in ["EDITOR", "VISUAL"] {
+        if let Ok(raw) = std::env::var(var) {
+            let parts: Vec<String> = raw.split_whitespace().map(|s| s.to_string()).collect();
+            if let Some(prog) = parts.first() {
+                if !prog.is_empty() {
+                    return Some((prog.clone(), parts[1..].to_vec()));
+                }
+            }
+        }
+    }
+    for name in ["nvim", "vim", "vi"] {
+        if executable_on_path(name) {
+            return Some((name.to_string(), Vec::new()));
+        }
+    }
+    None
+}
+
+fn executable_on_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .filter_map(|p| std::fs::metadata(&p).ok())
+        .any(|m| m.permissions().mode() & 0o111 != 0)
+}
+
+/// Open `initial` content in the user's editor and return what was saved.
+/// Suspends the TUI terminal for the editor session, then re-arms it.
+async fn edit_text_external(term: &mut TermGuard, initial: &str) -> anyhow::Result<String> {
+    term.suspend();
+    let _rearm = RearmGuard(term);
+    let (prog, args) = editor_parts().ok_or_else(|| {
+        anyhow::anyhow!("no editor found — set $EDITOR (e.g. `export EDITOR=nvim`)")
+    })?;
+    let tmp = tempfile::Builder::new()
+        .prefix("meeticulous-rename-")
+        .suffix(".txt")
+        .tempfile()?;
+    std::fs::write(tmp.path(), initial)?;
+    let status = tokio::process::Command::new(&prog)
+        .args(&args)
+        .arg(tmp.path())
+        .status()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to spawn editor {prog}: {e}"))?;
+    anyhow::ensure!(status.success(), "editor exited {status}");
+    Ok(std::fs::read_to_string(tmp.path())?)
+}
+
+/// Plan a bulk title rename. All-or-nothing: returns Err (joined problems) if
+/// any edited line is invalid, else the list of `(index, new_title)` to apply.
+fn plan_bulk_renames(orig: &[String], lines: &[&str]) -> Result<Vec<(usize, String)>, String> {
+    if lines.len() != orig.len() {
+        return Err(format!(
+            "line count changed ({} → {}); nothing applied",
+            orig.len(),
+            lines.len()
+        ));
+    }
+    let used: HashSet<&str> = orig.iter().map(|s| s.as_str()).collect();
+    let mut taken: HashSet<String> = HashSet::new();
+    let mut renames = Vec::new();
+    let mut errors = Vec::new();
+    for (i, (o, l)) in orig.iter().zip(lines.iter()).enumerate() {
+        let new = l.trim().to_string();
+        if new == *o {
+            continue;
+        }
+        if new.is_empty() {
+            errors.push(format!("line {}: title cannot be empty", i + 1));
+            continue;
+        }
+        if used.contains(new.as_str()) {
+            errors.push(format!(
+                "line {}: “{new}” is already another meeting's title",
+                i + 1
+            ));
+            continue;
+        }
+        if taken.contains(&new) {
+            errors.push(format!(
+                "line {}: “{new}” appears twice in this batch",
+                i + 1
+            ));
+            continue;
+        }
+        taken.insert(new.clone());
+        renames.push((i, new));
+    }
+    if errors.is_empty() {
+        Ok(renames)
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bulk_rename_plan_rejects_count_change() {
+        let orig = vec!["A".to_string(), "B".to_string()];
+        let err = plan_bulk_renames(&orig, &["A", "B", "C"]).unwrap_err();
+        assert!(err.contains("line count"));
+    }
+
+    #[test]
+    fn bulk_rename_plan_rejects_empty_and_collision() {
+        let orig = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let err = plan_bulk_renames(&orig, &["A", "", "A"]).unwrap_err();
+        assert!(err.contains("line 2: title cannot be empty"));
+        assert!(err.contains("line 3"));
+        assert!(err.contains("already another meeting's title"));
+    }
+
+    #[test]
+    fn bulk_rename_plan_rejects_batch_duplicates() {
+        let orig = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let err = plan_bulk_renames(&orig, &["X", "Y", "X"]).unwrap_err();
+        assert!(err.contains("appears twice"));
+    }
+
+    #[test]
+    fn bulk_rename_plan_returns_indexed_renames() {
+        let orig = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let plan = plan_bulk_renames(&orig, &["A", "Y", "Z"]).unwrap();
+        assert_eq!(plan, vec![(1, "Y".to_string()), (2, "Z".to_string())]);
+    }
+
+    #[test]
+    fn bulk_rename_plan_allows_unchanged_and_trim() {
+        let orig = vec!["A".to_string(), "B".to_string()];
+        let plan = plan_bulk_renames(&orig, &["A", "B"]).unwrap();
+        assert!(plan.is_empty());
+        let plan = plan_bulk_renames(&orig, &["  A  ", "B"]).unwrap();
+        assert!(
+            plan.is_empty(),
+            "trimmed title equal to original is unchanged"
+        );
+    }
 }
